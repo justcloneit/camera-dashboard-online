@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v167.0 — Single-File RTSP Camera Dashboard
+Camera Dashboard v168.0 — Single-File RTSP Camera Dashboard
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -105,7 +105,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '167.0'
+VERSION = '168.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -5477,7 +5477,7 @@ def _telegram_decrypt_config(include_disabled: bool = False) -> list[dict]:
 def _save_telegram_config(destinations: list[dict]) -> tuple[bool, str]:
     cipher = _telegram_cipher()
     if cipher is None:
-        return False, 'Secure encryption is unavailable. Install cryptography or configure CAMERA_ENCRYPTION_KEY/SESSION_SECRET.'
+        return False, "Secure encryption is unavailable because the Python package 'cryptography' is not installed. Add cryptography to requirements.txt and redeploy; setting CAMERA_ENCRYPTION_KEY alone cannot replace the package."
     clean=[]
     for d in destinations:
         token=str(d.get('bot_token') or '').strip()
