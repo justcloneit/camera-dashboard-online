@@ -1,4 +1,4 @@
-The application file is intentionally named **`camera_dashboard.py`**.
+- The application file is intentionally named **`camera_dashboard.py`**.
 You can run the same file locally, on Replit, Railway, Render, Fly.io,
 Docker, Docker Compose, or a Linux VPS.
 
