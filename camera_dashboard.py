@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v162.0 — Single-File RTSP Camera Dashboard
+Camera Dashboard v166.0 — Single-File RTSP Camera Dashboard
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
 Usage:
-    python3 camera_dashboard_standalone.py [--port 5000] [--host 0.0.0.0] [--dir .]
+    python3 camera_dashboard.py [--port $PORT] [--host 0.0.0.0] [--dir .]
     camera_dashboard.exe
 """
 
@@ -105,7 +105,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '165.0'
+VERSION = '166.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -14987,8 +14987,20 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=f'Camera Dashboard v{VERSION} — Single-File RTSP Viewer')
-    parser.add_argument('--port', type=int, default=int(os.getenv('PORT') or os.getenv('REPLIT_PORT') or '5000'), help='HTTP port (default: PORT/REPLIT_PORT/5000)')
-    parser.add_argument('--host', default=('0.0.0.0' if (os.getenv('REPL_ID') or os.getenv('REPLIT_DEV_DOMAIN') or os.getenv('REPLIT_DEPLOYMENT')) else '127.0.0.1'), help='Bind host (hosted=0.0.0.0, local=127.0.0.1 by default)')
+    # Hosted platforms (Railway, Render, Fly.io, Heroku-like platforms, Replit,
+    # and container hosts) route traffic to the container's network interface.
+    # Binding to 127.0.0.1 makes the app unreachable from outside the container.
+    hosted_env = bool(
+        os.getenv('PORT') or os.getenv('REPLIT_PORT') or os.getenv('RAILWAY_ENVIRONMENT')
+        or os.getenv('RAILWAY_PROJECT_ID') or os.getenv('RENDER') or os.getenv('FLY_APP_NAME')
+        or os.getenv('DYNO') or os.getenv('KOYEB_APP_NAME') or os.getenv('SPACE_ID')
+        or os.getenv('REPL_ID') or os.getenv('REPLIT_DEV_DOMAIN') or os.getenv('REPLIT_DEPLOYMENT')
+    )
+    platform_port = os.getenv('PORT') or os.getenv('REPLIT_PORT')
+    parser.add_argument('--port', type=int, default=int(platform_port or '5000'),
+                        help='HTTP port (uses PORT/REPLIT_PORT on hosted platforms; otherwise 5000)')
+    parser.add_argument('--host', default=('0.0.0.0' if hosted_env else '127.0.0.1'),
+                        help='Bind host (hosted platforms require 0.0.0.0)')
     parser.add_argument('--dir',  default=SCRIPT_DIR,     help='Directory to scan for cameras')
     parser.add_argument('--data-dir', default=os.getenv('CAMERA_DATA_DIR', DATA_DIR), help='Runtime data directory for DB/logs/backups/snapshots/config')
     parser.add_argument('--no-browser', action='store_true', help='Do not auto-open browser')
@@ -15001,6 +15013,14 @@ def main() -> None:
     parser.add_argument('--create-db-if-missing', action='store_true',
                         help='Create a fresh SQLite database only when the live DB is missing and no verified backup exists; never replace a corrupt existing DB.')
     args = parser.parse_args()
+    # A deployment Start Command may explicitly contain --host 127.0.0.1 from
+    # an older configuration. On hosted platforms, correct that unsafe binding
+    # automatically so the deployment remains reachable without editing each
+    # platform's start command. Local-only binding remains available locally.
+    if hosted_env and args.host.strip().lower() in {'127.0.0.1', 'localhost', '::1'}:
+        if os.getenv('CAMERA_ALLOW_LOOPBACK_HOST', '').strip().lower() not in {'1', 'true', 'yes'}:
+            log.warning('[HTTP] Hosted environment detected; overriding loopback bind %s with 0.0.0.0', args.host)
+            args.host = '0.0.0.0'
     worker_arg = str(args.workers).strip().lower()
     if worker_arg != 'auto':
         if not worker_arg.isdigit() or not 1 <= int(worker_arg) <= 64:
@@ -15222,7 +15242,7 @@ def main() -> None:
         _touch_worker('worker-supervisor','stopped','disabled by operator')
 
     # Never try to open a local browser in hosted/Replit environments.
-    hosted = bool(os.getenv('REPL_ID') or os.getenv('REPLIT_DEV_DOMAIN') or os.getenv('REPLIT_DEPLOYMENT'))
+    hosted = hosted_env
     if not args.no_browser and not hosted:
         def _open_when_ready():
             deadline=time.monotonic()+20
@@ -15244,12 +15264,12 @@ def main() -> None:
     print(f'  🌐  Open  : http://{args.host}:{args.port}')
     print(f'  ❤️  Health : http://{args.host}:{args.port}/healthz')
     if hosted:
-        print('  ☁️  Hosted/Replit mode detected — using PORT/REPLIT_PORT and 0.0.0.0 binding')
+        print('  ☁️  Hosted platform detected — using platform PORT and 0.0.0.0 binding')
     print(f'  Logs      : {os.path.join(LOG_DIR, "dashboard.log")}')
     print(f'  Services  : {BACKGROUND_SERVICES_CONFIG_PATH} (persistent ON/OFF)')
     print(f'  Scanning camera files in background…\n')
 
-    log.info('[HTTP] Startup critical path complete; binding Flask server now on %s:%d (Replit PORT=%s)',
+    log.info('[HTTP] Startup critical path complete; binding Flask server now on %s:%d (platform PORT=%s)',
              args.host, args.port, os.getenv('PORT') or os.getenv('REPLIT_PORT') or 'unset')
     try:
         app.run(host=args.host, port=args.port, debug=False, threaded=True, use_reloader=False)
