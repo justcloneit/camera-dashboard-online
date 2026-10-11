@@ -105,7 +105,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '164.0'
+VERSION = '165.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -1299,6 +1299,8 @@ def _required_permission_for_request() -> str | None:
     # stream.view permission. dashboard.view alone must never grant playback.
     if path.startswith('/stream/') or path.startswith('/ws/stream/') or path.endswith('/rtsp'):
         return 'stream.view'
+    if path.startswith('/stop/'):
+        return 'stream.view'
     if 'diagnostic' in path or path.endswith('/diagnose'):
         return 'diagnostics.run'
     if path.startswith('/api/category/') or path.startswith('/api/bulk/') or path.startswith('/api/cameras/') and method in {'POST','PUT','PATCH','DELETE'}:
@@ -1912,13 +1914,39 @@ def _install_shutdown_signal_handlers() -> None:
         log.warning('Could not install shutdown signal handlers: %s', e)
 
 
-def _sqlite_quick_check_ok(path: str) -> bool:
-    """Fast, read-only SQLite startup check.
+def _sqlite_fast_probe_ok(path: str) -> bool:
+    """Very fast SQLite structural probe used on the startup critical path.
 
-    Full PRAGMA integrity_check can scan a large database for minutes and must
-    never block HTTP startup. quick_check(1) is used as the normal startup
-    gate; the full integrity check remains available to the background
-    integrity service and is still used as the fallback when quick_check fails.
+    A PRAGMA quick_check(1) can still scan a large database and was observed
+    taking several minutes. Startup must not be held hostage by a full-table
+    diagnostic. This probe opens the database read-only, verifies the SQLite
+    header/schema can be read, checks the cameras table exists when expected,
+    and reads one row without scanning the table. Deeper integrity checks are
+    performed by the optional maintenance/integrity service instead.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) <= 0:
+        return False
+    conn = None
+    try:
+        uri = 'file:' + os.path.abspath(path).replace('\\', '/') + '?mode=ro'
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        conn.execute('PRAGMA schema_version').fetchone()
+        row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cameras' LIMIT 1").fetchone()
+        if row is not None:
+            conn.execute('SELECT 1 FROM cameras LIMIT 1').fetchone()
+        return True
+    except sqlite3.Error as e:
+        log.error('SQLite fast startup probe failed for %s: %s', path, e)
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def _sqlite_quick_check_ok(path: str) -> bool:
+    """Run SQLite quick_check for an explicit/on-demand diagnostic.
+
+    This is deliberately not used as the normal startup gate because SQLite
+    quick_check can scan a large database and take minutes.
     """
     if not os.path.exists(path):
         return False
@@ -1957,9 +1985,12 @@ def _background_live_integrity_check() -> None:
         _touch_worker('db-integrity','stopped','disabled by operator'); return
     try:
         _touch_worker('db-integrity','running')
-        ok = _sqlite_integrity_ok(DB_PATH)
-        _touch_worker('db-integrity','idle' if ok else 'error', 'integrity_check=ok' if ok else 'integrity_check=failed')
-        log.info('[Services] Background full integrity check %s', 'PASS' if ok else 'FAILED')
+        deep = os.getenv('CAMERA_BACKGROUND_FULL_INTEGRITY', '').strip().lower() in {'1','true','yes','on'}
+        started = time.monotonic()
+        ok = _sqlite_integrity_ok(DB_PATH) if deep else _sqlite_quick_check_ok(DB_PATH)
+        mode = 'integrity_check' if deep else 'quick_check'
+        _touch_worker('db-integrity','idle' if ok else 'error', f'{mode}=ok' if ok else f'{mode}=failed')
+        log.info('[Services] Background %s %s in %.2fs', mode, 'PASS' if ok else 'FAILED', time.monotonic() - started)
     except Exception as exc:
         _touch_worker('db-integrity','error',type(exc).__name__)
         log.warning('[Services] Background full integrity check failed: %s', exc)
@@ -2094,9 +2125,11 @@ def _recover_database_if_needed(allow_create_if_missing: bool = False) -> None:
             verified = _sqlite_integrity_ok(DB_PATH)
         else:
             started = time.monotonic()
-            verified = _sqlite_quick_check_ok(DB_PATH)
-            log.info('[DB Protection] Quick database check %s in %.2fs: %s',
+            verified = _sqlite_fast_probe_ok(DB_PATH)
+            log.info('[DB Protection] Fast database startup probe %s in %.2fs: %s',
                      'PASS' if verified else 'FAILED', time.monotonic() - started, DB_PATH)
+            if verified and os.path.getsize(DB_PATH) >= 64 * 1024 * 1024:
+                log.info('[DB Protection] Deep SQLite quick_check deferred to background maintenance for large DB')
         if verified:
             log.info('[DB Protection] Live database verified: %s', DB_PATH)
             return
@@ -2518,7 +2551,7 @@ def db_create_backup(clean_old: bool = True, _shutdown: bool = False) -> bool:
         # and leave the last verified .bak untouched.
         backup_deadline = time.monotonic() + max(
             10.0,
-            float(os.getenv('CAMERA_BACKUP_TIMEOUT_SECONDS', '300'))
+            float(os.getenv('CAMERA_BACKUP_TIMEOUT_SECONDS', '900'))
         )
         def _backup_progress(status, remaining, total):
             if _shutdown_requested.is_set():
@@ -2526,21 +2559,30 @@ def db_create_backup(clean_old: bool = True, _shutdown: bool = False) -> bool:
             if time.monotonic() >= backup_deadline:
                 raise TimeoutError('SQLite backup deadline exceeded')
         source.backup(dest, pages=1000, progress=_backup_progress, sleep=0.05)
-        result=dest.execute('PRAGMA integrity_check').fetchall()
-        if len(result)!=1 or result[0][0]!='ok':
-            raise sqlite3.DatabaseError('backup integrity check failed')
         dest.commit(); dest.close(); dest=None
-        # Verify the file after close, then publish atomically under the short
-        # writer lock only for the filesystem publication/cleanup phase.
-        if not _sqlite_integrity_ok(tmp):
-            raise sqlite3.DatabaseError('closed backup integrity check failed')
+        # Do not run a second full integrity scan here. That doubled backup
+        # latency on large databases and could make the backup appear hung.
+        # The default publication check is structural/fast; operators can opt
+        # into the heavier quick/full verification when needed.
+        verify_mode = os.getenv('CAMERA_BACKUP_VERIFY_MODE', 'fast').strip().lower()
+        if verify_mode == 'full':
+            verified = _sqlite_integrity_ok(tmp)
+        elif verify_mode == 'quick':
+            verified = _sqlite_quick_check_ok(tmp)
+        else:
+            verified = _sqlite_fast_probe_ok(tmp)
+        if not verified:
+            raise sqlite3.DatabaseError(f'backup {verify_mode} verification failed')
         with _DB_WRITE_LOCK:
             os.replace(tmp, DB_BACKUPS[0])
             if clean_old:
                 _cleanup_old_database_backups(DB_BACKUPS[0])
         log.info('SQLite backup created: %s (single-backup policy)', DB_BACKUPS[0])
         return True
-    except (OSError,sqlite3.Error,TimeoutError,RuntimeError) as e:
+    except TimeoutError as e:
+        log.warning('SQLite backup deferred/aborted: %s', e)
+        return False
+    except (OSError,sqlite3.Error,RuntimeError) as e:
         log.error('SQLite backup failed: %s',e)
         return False
     finally:
@@ -6814,7 +6856,11 @@ function stopCam(id) {
   else if (ph) { ph.style.display = ''; }
   const watchBtn = document.querySelector(`.cam-card[data-id="${id}"] .watch-btn`);
   if (watchBtn) { watchBtn.textContent = '▶ Watch'; watchBtn.classList.add('btn-green'); }
-  navigator.sendBeacon('/stop/' + id);
+  try {
+    const csrf=document.querySelector('meta[name="csrf-token"]')?.content||'';
+    const fd=new FormData(); fd.append('_csrf',csrf);
+    navigator.sendBeacon('/stop/' + id, fd);
+  } catch(_) { fetch('/stop/' + id,{method:'POST'}).catch(()=>{}); }
 }
 
 function stopAllCams() {
