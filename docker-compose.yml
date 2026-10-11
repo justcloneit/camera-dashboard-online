@@ -1,0 +1,19 @@
+services:
+  camera-dashboard:
+    build: .
+    container_name: camera-dashboard
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      PORT: "5000"
+      CAMERA_HOST: "0.0.0.0"
+      CAMERA_DATA_DIR: "/data"
+      CAMERA_SCAN_DIR: "/app"
+      CAMERA_NO_BROWSER: "1"
+      CAMERA_WORKERS: "auto"
+      CAMERA_VALIDATION_BATCH: "300"
+      CAMERA_MAX_LIVE_STREAMS: "16"
+    volumes:
+      - ./camera_data:/data
+      - ./inventory:/app/inventory

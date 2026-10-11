@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: camera-dashboard
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    autoDeploy: false
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: CAMERA_HOST
+        value: "0.0.0.0"
+      - key: CAMERA_NO_BROWSER
+        value: "1"
+      - key: CAMERA_DATA_DIR
+        value: "/data"
+      - key: CAMERA_MAX_LIVE_STREAMS
+        value: "16"
+      - key: CAMERA_WORKERS
+        value: "auto"
+      - key: CAMERA_VALIDATION_BATCH
+        value: "300"
+    # Add a persistent disk in Render when SQLite/snapshots must survive deploys.
+    # disk:
+    #   name: camera-dashboard-data
+    #   mountPath: /data
+    #   sizeGB: 10
