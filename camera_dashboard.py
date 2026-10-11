@@ -105,7 +105,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '163.0'
+VERSION = '164.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -5397,7 +5397,13 @@ def _telegram_db_ciphertext() -> str:
         return ''
 
 
-def _telegram_decrypt_config() -> list[dict]:
+def _telegram_decrypt_config(include_disabled: bool = False) -> list[dict]:
+    """Decrypt all Telegram destinations without exposing credentials to the UI.
+
+    Normal delivery returns enabled destinations only.  Administrative metadata
+    views may request disabled entries as well so the dashboard can show and
+    manage the complete destination list without returning tokens/chat IDs.
+    """
     ciphertext = _telegram_db_ciphertext()
     if not ciphertext:
         return []
@@ -5411,12 +5417,14 @@ def _telegram_decrypt_config() -> list[dict]:
         items = cfg.get('destinations') if isinstance(cfg, dict) else None
         if not isinstance(items, list):
             return []
-        return [
-            {str(k): v for k, v in d.items()}
-            for d in items
-            if isinstance(d, dict) and d.get('enabled', True)
-            and d.get('bot_token') and d.get('chat_id')
-        ]
+        result = []
+        for d in items:
+            if not isinstance(d, dict) or not d.get('bot_token') or not d.get('chat_id'):
+                continue
+            if not include_disabled and not d.get('enabled', True):
+                continue
+            result.append({str(k): v for k, v in d.items()})
+        return result
     except InvalidToken:
         log.error('[Telegram Security] Telegram credentials could not be decrypted. Check CAMERA_ENCRYPTION_KEY/SESSION_SECRET.')
     except Exception as exc:
@@ -5469,14 +5477,11 @@ def _delete_telegram_config() -> tuple[bool, str]:
         return False, f'Could not remove Telegram configuration: {type(exc).__name__}'
 
 
-def _legacy_tg_file_destinations() -> list[dict]:
+def _legacy_tg_file_destinations(include_disabled: bool = False) -> list[dict]:
     """Load the existing plaintext Telegram config for backward compatibility.
 
-    This remains enabled by default so an existing telegram_config.json keeps
-    working after upgrading. The plaintext file is NEVER copied into the
-    browser response and is only read server-side for Telegram delivery.
-    Administrators can use the dashboard's "Import & Encrypt" action to move
-    the same credentials into encrypted SQLite storage.
+    Multiple destinations are preserved. The plaintext values remain server-side
+    only; the dashboard receives names/status metadata, never bot tokens or chat IDs.
     """
     for path in [TG_CONFIG, os.path.join(SCRIPT_DIR, 'a.json')]:
         if not os.path.exists(path):
@@ -5485,13 +5490,16 @@ def _legacy_tg_file_destinations() -> list[dict]:
             with open(path, encoding='utf-8') as fh:
                 cfg = json.load(fh)
             if isinstance(cfg, dict) and isinstance(cfg.get('destinations'), list):
-                return [
-                    d for d in cfg['destinations']
-                    if isinstance(d, dict) and d.get('enabled', True)
-                    and d.get('bot_token') and d.get('chat_id')
-                ]
+                result = []
+                for d in cfg['destinations']:
+                    if not isinstance(d, dict) or not d.get('bot_token') or not d.get('chat_id'):
+                        continue
+                    if not include_disabled and not d.get('enabled', True):
+                        continue
+                    result.append(d)
+                return result
             if isinstance(cfg, dict) and cfg.get('bot_token') and cfg.get('chat_id'):
-                return [cfg]
+                return [cfg] if include_disabled or cfg.get('enabled', True) else []
         except Exception:
             continue
     return []
@@ -6500,26 +6508,33 @@ dialog h2{margin-bottom:14px;font-size:16px;color:var(--accent)}
   <div class="modal-actions"><button type="button" class="btn" onclick="closeDeviceDialog('device-intel-modal')">Close</button></div>
 </dialog>
 
-<dialog id="telegram-settings-modal" style="width:min(620px,94vw);max-width:620px">
+<dialog id="telegram-settings-modal" style="width:min(700px,94vw);max-width:700px">
   <h2>🔐 Telegram Secure Settings</h2>
   <p style="color:var(--muted);line-height:1.45">
-    Enter the Bot Token and Chat ID here. They are encrypted before being written to SQLite;
-    the plaintext values are not returned by the dashboard API and are not displayed after saving. An existing telegram_config.json is also supported for backward compatibility.
+    Multiple Telegram destinations are supported. Every enabled destination receives the same status, alert, test message, snapshot or export. Bot Tokens and Chat IDs are encrypted before being written to SQLite and are never returned to the browser.
   </p>
   <div id="telegram-secure-status" style="padding:8px 10px;border-radius:7px;background:var(--bg);margin:10px 0;color:var(--muted)">Loading…</div>
-  <form onsubmit="saveTelegramSettings(event)">
-    <div class="field"><label>Destination name</label><input id="tg-sec-name" value="My Telegram" maxlength="100"></div>
+  <div style="font-weight:700;margin:12px 0 6px">Configured destinations</div>
+  <div id="telegram-destination-list" style="display:grid;gap:7px;margin-bottom:14px"></div>
+
+  <form onsubmit="addTelegramDestination(event)" style="border:1px solid var(--border);border-radius:8px;padding:10px">
+    <div style="font-weight:700;margin-bottom:8px">➕ Add destination</div>
+    <div class="field"><label>Destination name</label><input id="tg-sec-name" value="Telegram Destination" maxlength="100"></div>
     <div class="field"><label>Bot Token</label><input id="tg-sec-token" type="password" autocomplete="new-password" placeholder="123456789:AA..." required></div>
     <div class="field"><label>Chat ID</label><input id="tg-sec-chat" type="password" autocomplete="off" placeholder="123456789 or -100..." required></div>
-    <label style="display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px"><input id="tg-sec-enabled" type="checkbox" checked style="width:auto"> Enabled</label>
+    <label style="display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px"><input id="tg-sec-enabled" type="checkbox" checked style="width:auto"> Enabled — this destination receives messages</label>
     <div class="modal-actions">
-      <button type="button" class="btn" onclick="document.getElementById('telegram-settings-modal').close()">Cancel</button>
-      <button type="button" class="btn" onclick="importTelegramFile()">🔒 Import file & encrypt</button>
-      <button type="button" class="btn" onclick="testTelegram()">🧪 Test current config</button>
-      <button type="submit" class="btn btn-green">🔒 Save Encrypted</button>
-      <button type="button" class="btn" style="color:#ff7b72" onclick="deleteTelegramSettings()">🗑 Remove</button>
+      <button type="submit" class="btn btn-green">🔒 Add & Encrypt</button>
+      <button type="button" class="btn" onclick="clearTelegramAddFields()">Clear</button>
     </div>
   </form>
+
+  <div class="modal-actions" style="margin-top:10px">
+    <button type="button" class="btn" onclick="document.getElementById('telegram-settings-modal').close()">Close</button>
+    <button type="button" class="btn" onclick="importTelegramFile()">🔒 Import all from file & encrypt</button>
+    <button type="button" class="btn" onclick="testTelegram()">🧪 Test all destinations</button>
+    <button type="button" class="btn" style="color:#ff7b72" onclick="deleteTelegramSettings()">🗑 Remove all</button>
+  </div>
   <p style="font-size:11px;color:var(--muted);margin-top:10px">
     Security note: the encryption key is not stored in the database. Production deployments should set a persistent
     <code>CAMERA_ENCRYPTION_KEY</code> or <code>SESSION_SECRET</code>. If neither exists, the app creates a local 0600 master-key file.
@@ -7020,60 +7035,90 @@ async function openTelegramSettings() {
   const dlg=document.getElementById('telegram-settings-modal');
   if (!dlg) return;
   dlg.showModal();
-  const st=document.getElementById('telegram-secure-status');
-  st.textContent='⏳ Checking secure Telegram storage…';
-  try {
-    const d=await fetch('/api/telegram/secure-status').then(async r=>{const x=await r.json(); if(!r.ok) throw Error(x.detail||('HTTP '+r.status)); return x;});
-    st.textContent=d.encrypted ? '🔒 Encrypted Telegram configuration is saved. Token and Chat ID are hidden.' : (d.source==='plaintext-file' ? '⚠️ Existing telegram_config.json is active. Telegram works, but the credentials are plaintext on disk. Use “Import file & encrypt”.' : '⚪ No Telegram configuration is saved yet.');
-    if (d.configured) {
-      document.getElementById('tg-sec-name').value=d.name || 'My Telegram';
-      document.getElementById('tg-sec-token').value='';
-      document.getElementById('tg-sec-chat').value='';
-      document.getElementById('tg-sec-token').placeholder='Saved — enter a new token only to replace it';
-      document.getElementById('tg-sec-chat').placeholder='Saved — enter a new Chat ID only to replace it';
-    }
-  } catch(e) { st.textContent='❌ '+e.message; }
+  await refreshTelegramDestinations();
 }
 
-async function saveTelegramSettings(e) {
+function clearTelegramAddFields() {
+  document.getElementById('tg-sec-name').value='Telegram Destination';
+  document.getElementById('tg-sec-token').value='';
+  document.getElementById('tg-sec-chat').value='';
+  document.getElementById('tg-sec-enabled').checked=true;
+}
+
+async function refreshTelegramDestinations() {
+  const st=document.getElementById('telegram-secure-status');
+  const list=document.getElementById('telegram-destination-list');
+  st.textContent='⏳ Checking Telegram destinations…';
+  list.innerHTML='';
+  try {
+    const d=await fetch('/api/telegram/secure-status').then(async r=>{const x=await r.json(); if(!r.ok) throw Error(x.detail||('HTTP '+r.status)); return x;});
+    if (!d.configured) {
+      st.textContent='⚪ No Telegram destinations are configured yet.';
+      list.innerHTML='<div style="color:var(--muted);padding:8px">No destinations. Add one below or import your existing telegram_config.json.</div>';
+      return;
+    }
+    const sourceText=d.encrypted ? '🔒 Encrypted SQLite' : '⚠️ Existing plaintext file';
+    st.textContent=sourceText+' · '+d.count+' destination(s). Enabled destinations receive the same outgoing messages.';
+    (d.destinations||[]).forEach(x=>{
+      const row=document.createElement('div');
+      row.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid var(--border);border-radius:7px;background:var(--bg)';
+      const state=x.enabled ? '🟢 Enabled' : '⚪ Disabled';
+      row.innerHTML='<div><strong>'+escapeHtml(x.name||('Telegram '+(x.index+1)))+'</strong><div style="font-size:11px;color:var(--muted)">'+state+' · credentials hidden</div></div>' +
+        '<button type="button" class="btn" style="color:#ff7b72" onclick="removeTelegramDestination('+Number(x.index)+')">Remove</button>';
+      list.appendChild(row);
+    });
+  } catch(e) {
+    st.textContent='❌ '+e.message;
+    list.innerHTML='<div style="color:#ff7b72">Could not load Telegram destinations.</div>';
+  }
+}
+
+async function addTelegramDestination(e) {
   e.preventDefault();
   const st=document.getElementById('telegram-secure-status');
-  st.textContent='⏳ Encrypting and saving…';
-  const body={name:document.getElementById('tg-sec-name').value.trim(),bot_token:document.getElementById('tg-sec-token').value,chat_id:document.getElementById('tg-sec-chat').value,enabled:document.getElementById('tg-sec-enabled').checked};
+  st.textContent='⏳ Encrypting and adding destination…';
+  const body={action:'add',name:document.getElementById('tg-sec-name').value.trim(),bot_token:document.getElementById('tg-sec-token').value,chat_id:document.getElementById('tg-sec-chat').value,enabled:document.getElementById('tg-sec-enabled').checked};
   try {
     const r=await fetch('/api/telegram/secure-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json(); if(!r.ok||!d.ok) throw Error(d.detail||('HTTP '+r.status));
-    st.textContent='✅ '+d.detail;
-    document.getElementById('tg-sec-token').value=''; document.getElementById('tg-sec-chat').value='';
-    document.getElementById('tg-sec-token').placeholder='Saved — enter a new token only to replace it';
-    document.getElementById('tg-sec-chat').placeholder='Saved — enter a new Chat ID only to replace it';
-    showTgToast('🔒 Telegram credentials encrypted and saved');
-    setTimeout(()=>location.reload(),700);
+    showTgToast('🔒 Destination added and encrypted');
+    clearTelegramAddFields();
+    await refreshTelegramDestinations();
+  } catch(e) { st.textContent='❌ '+e.message; }
+}
+
+async function removeTelegramDestination(index) {
+  if (!confirm('Remove this Telegram destination? Its encrypted Bot Token and Chat ID will be removed from the database.')) return;
+  const st=document.getElementById('telegram-secure-status'); st.textContent='⏳ Removing destination…';
+  try {
+    const r=await fetch('/api/telegram/secure-config',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:index})});
+    const d=await r.json(); if(!r.ok||!d.ok) throw Error(d.detail||('HTTP '+r.status));
+    showTgToast('🗑 Destination removed');
+    await refreshTelegramDestinations();
   } catch(e) { st.textContent='❌ '+e.message; }
 }
 
 async function importTelegramFile() {
   const st=document.getElementById('telegram-secure-status');
-  if (!confirm('Import the existing telegram_config.json into encrypted SQLite storage? The plaintext file will NOT be deleted.')) return;
-  st.textContent='⏳ Importing and encrypting…';
+  if (!confirm('Import ALL valid destinations from telegram_config.json into encrypted SQLite storage? The plaintext file will NOT be deleted.')) return;
+  st.textContent='⏳ Importing and encrypting all destinations…';
   try {
     const r=await fetch('/api/telegram/import-file',{method:'POST'});
     const d=await r.json();
     if(!r.ok||!d.ok) throw Error(d.detail||('HTTP '+r.status));
-    st.textContent='✅ '+d.detail+' The original plaintext file was left unchanged.';
-    showTgToast('🔒 Telegram file imported and encrypted');
-    setTimeout(()=>location.reload(),900);
+    showTgToast('🔒 '+d.imported+' destination(s) imported and encrypted');
+    await refreshTelegramDestinations();
   } catch(e) { st.textContent='❌ '+e.message; }
 }
 
 async function deleteTelegramSettings() {
-  if (!confirm('Remove the encrypted Telegram Bot Token and Chat ID from the database?')) return;
-  const st=document.getElementById('telegram-secure-status'); st.textContent='⏳ Removing…';
+  if (!confirm('Remove ALL encrypted Telegram destinations from the database?')) return;
+  const st=document.getElementById('telegram-secure-status'); st.textContent='⏳ Removing all…';
   try {
     const r=await fetch('/api/telegram/secure-config',{method:'DELETE'});
     const d=await r.json(); if(!r.ok||!d.ok) throw Error(d.detail||('HTTP '+r.status));
-    st.textContent='✅ '+d.detail; showTgToast('🗑 Telegram configuration removed');
-    setTimeout(()=>location.reload(),700);
+    showTgToast('🗑 All Telegram destinations removed');
+    await refreshTelegramDestinations();
   } catch(e) { st.textContent='❌ '+e.message; }
 }
 
@@ -11726,23 +11771,32 @@ def telegram_secure_status() -> Response:
     denied = _admin_only()
     if denied:
         return denied
-    items = _telegram_decrypt_config()
-    item = items[0] if items else None
+    encrypted_all = _telegram_decrypt_config(include_disabled=True)
     ciphertext = _telegram_db_ciphertext()
-    encrypted = bool(ciphertext and items)
-    file_items = _legacy_tg_file_destinations() if not encrypted else []
+    encrypted = bool(ciphertext and encrypted_all)
+    file_items = _legacy_tg_file_destinations(include_disabled=True) if not encrypted else []
+    items = encrypted_all or file_items
     source = 'encrypted-db' if encrypted else ('plaintext-file' if file_items else 'none')
+    metadata = [
+        {
+            'index': i,
+            'name': str(d.get('name') or f'Telegram {i + 1}')[:100],
+            'enabled': bool(d.get('enabled', True)),
+        }
+        for i, d in enumerate(items)
+    ]
     return jsonify({
         'ok': True,
-        'configured': bool(items or file_items),
-        'count': len(items or file_items),
-        'name': item.get('name','Telegram') if item else ((file_items[0].get('name','Telegram') if file_items else '')),
+        'configured': bool(items),
+        'count': len(items),
+        'name': metadata[0]['name'] if metadata else '',
+        'destinations': metadata,
         'encrypted': encrypted,
         'source': source,
         'plaintext_file_present': bool(file_items),
         'detail': (
-            'Credentials are stored encrypted in SQLite.' if encrypted else
-            'Existing telegram_config.json is being used. Import it to encrypt the credentials in SQLite.' if file_items else
+            f'{len(items)} Telegram destination(s) are stored encrypted in SQLite.' if encrypted else
+            f'{len(file_items)} destination(s) from the existing telegram_config.json are active. Import them to encrypt.' if file_items else
             'No Telegram configuration is saved.'
         )
     })
@@ -11754,22 +11808,54 @@ def telegram_secure_config() -> Response:
     if denied:
         return denied
     if request.method == 'DELETE':
-        ok, detail = _delete_telegram_config()
-        return jsonify({'ok': ok, 'detail': detail}), (200 if ok else 500)
+        d = request.get_json(silent=True) or {}
+        index = d.get('index')
+        if index is None:
+            ok, detail = _delete_telegram_config()
+            return jsonify({'ok': ok, 'detail': detail}), (200 if ok else 500)
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'detail': 'Invalid destination index.'}), 400
+        items = _telegram_decrypt_config(include_disabled=True)
+        if not items:
+            items = _legacy_tg_file_destinations(include_disabled=True)
+        if index < 0 or index >= len(items):
+            return jsonify({'ok': False, 'detail': 'Destination not found.'}), 404
+        removed = items.pop(index)
+        if items:
+            ok, detail = _save_telegram_config(items)
+        else:
+            ok, detail = _delete_telegram_config()
+        if ok:
+            return jsonify({'ok': True, 'detail': f"Removed Telegram destination '{str(removed.get('name') or 'Telegram')[:100]}'.", 'remaining': len(items)})
+        return jsonify({'ok': False, 'detail': detail}), 500
+
     d = request.get_json(silent=True) or {}
+    action = str(d.get('action') or 'replace').strip().lower()
     token = str(d.get('bot_token') or '').strip()
     chat_id = str(d.get('chat_id') or '').strip()
     name = str(d.get('name') or 'My Telegram').strip()[:100]
     enabled = bool(d.get('enabled', True))
-    # For safety, replacing an existing configuration requires the new token
-    # and chat ID together. The existing encrypted credentials are never sent
-    # back to the browser.
     if not token or not chat_id:
-        return jsonify({'ok': False, 'detail': 'Bot Token and Chat ID are required when saving or replacing Telegram configuration.'}), 400
+        return jsonify({'ok': False, 'detail': 'Bot Token and Chat ID are required.'}), 400
     if len(token) > 512 or len(chat_id) > 256:
         return jsonify({'ok': False, 'detail': 'Telegram credential field is too long.'}), 400
-    ok, detail = _save_telegram_config([{'name': name, 'bot_token': token, 'chat_id': chat_id, 'enabled': enabled}])
-    return jsonify({'ok': ok, 'detail': detail}), (200 if ok else 500)
+
+    new_item = {'name': name, 'bot_token': token, 'chat_id': chat_id, 'enabled': enabled}
+    if action == 'add':
+        items = _telegram_decrypt_config(include_disabled=True)
+        if not items:
+            items = _legacy_tg_file_destinations(include_disabled=True)
+        items.append(new_item)
+        ok, detail = _save_telegram_config(items)
+        return jsonify({'ok': ok, 'detail': detail, 'added': name, 'count': len(items)}), (200 if ok else 500)
+
+    # Backward-compatible replace operation: replace the complete encrypted list
+    # with the single supplied destination. The dashboard uses action=add for new
+    # destinations so existing destinations are preserved.
+    ok, detail = _save_telegram_config([new_item])
+    return jsonify({'ok': ok, 'detail': detail, 'count': 1}), (200 if ok else 500)
 
 
 @app.route('/api/telegram/import-file', methods=['POST'])
