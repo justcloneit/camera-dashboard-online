@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v166.0 — Single-File RTSP Camera Dashboard
+Camera Dashboard v167.0 — Single-File RTSP Camera Dashboard
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -105,7 +105,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '166.0'
+VERSION = '167.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -6573,10 +6573,13 @@ dialog h2{margin-bottom:14px;font-size:16px;color:var(--accent)}
 
   <div class="modal-actions" style="margin-top:10px">
     <button type="button" class="btn" onclick="document.getElementById('telegram-settings-modal').close()">Close</button>
-    <button type="button" class="btn" onclick="importTelegramFile()">🔒 Import all from file & encrypt</button>
+    <input id="tg-user-config-file" type="file" accept=".json,application/json" style="display:none" onchange="importTelegramUpload(this)">
+    <button type="button" class="btn btn-green" onclick="document.getElementById('tg-user-config-file').click()">📂 Choose telegram_config.json from my device</button>
+    <button type="button" class="btn" onclick="importTelegramFile()" title="Use a config file already present on the server">🗄 Import server file</button>
     <button type="button" class="btn" onclick="testTelegram()">🧪 Test all destinations</button>
     <button type="button" class="btn" style="color:#ff7b72" onclick="deleteTelegramSettings()">🗑 Remove all</button>
   </div>
+  <p style="font-size:11px;color:var(--muted);margin-top:8px">Choose the JSON file from your computer. It is parsed in memory and valid Bot Tokens / Chat IDs are encrypted into this deployment's SQLite database; the uploaded file is not saved as a plaintext file.</p>
   <p style="font-size:11px;color:var(--muted);margin-top:10px">
     Security note: the encryption key is not stored in the database. Production deployments should set a persistent
     <code>CAMERA_ENCRYPTION_KEY</code> or <code>SESSION_SECRET</code>. If neither exists, the app creates a local 0600 master-key file.
@@ -7142,6 +7145,36 @@ async function removeTelegramDestination(index) {
     showTgToast('🗑 Destination removed');
     await refreshTelegramDestinations();
   } catch(e) { st.textContent='❌ '+e.message; }
+}
+
+async function importTelegramUpload(input) {
+  const file=input && input.files && input.files[0];
+  if (!file) return;
+  const st=document.getElementById('telegram-secure-status');
+  if (!/\.json$/i.test(file.name) && file.type!=='application/json') {
+    st.textContent='❌ Please select a .json Telegram configuration file.';
+    input.value=''; return;
+  }
+  if (file.size > 1024*1024) {
+    st.textContent='❌ File is too large. Maximum size is 1 MB.';
+    input.value=''; return;
+  }
+  if (!confirm('Import valid Telegram destinations from '+file.name+' and encrypt them in this deployment? Existing encrypted destinations will be replaced.')) {
+    input.value=''; return;
+  }
+  st.textContent='⏳ Uploading JSON and encrypting Telegram credentials…';
+  try {
+    const fd=new FormData(); fd.append('file',file,file.name);
+    const r=await fetch('/api/telegram/import-upload',{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok||!d.ok) throw Error(d.detail||('HTTP '+r.status));
+    showTgToast('🔒 '+d.imported+' destination(s) imported and encrypted');
+    input.value='';
+    await refreshTelegramDestinations();
+  } catch(e) {
+    st.textContent='❌ '+e.message;
+    input.value='';
+  }
 }
 
 async function importTelegramFile() {
@@ -11902,6 +11935,68 @@ def telegram_secure_config() -> Response:
     # destinations so existing destinations are preserved.
     ok, detail = _save_telegram_config([new_item])
     return jsonify({'ok': ok, 'detail': detail, 'count': 1}), (200 if ok else 500)
+
+
+@app.route('/api/telegram/import-upload', methods=['POST'])
+def telegram_import_upload() -> Response:
+    """Import a user-selected JSON file without persisting plaintext credentials."""
+    denied = _admin_only()
+    if denied:
+        return denied
+    upload = request.files.get('file')
+    if upload is None or not str(upload.filename or '').strip():
+        return jsonify({'ok': False, 'detail': 'Choose a telegram_config.json file first.'}), 400
+    filename = os.path.basename(upload.filename or 'telegram_config.json')
+    if not filename.lower().endswith('.json'):
+        return jsonify({'ok': False, 'detail': 'Only .json Telegram configuration files are supported.'}), 400
+    try:
+        raw = upload.stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return jsonify({'ok': False, 'detail': 'JSON file exceeds the 1 MB upload limit.'}), 413
+        cfg = json.loads(raw.decode('utf-8-sig'))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({'ok': False, 'detail': 'The selected file is not valid UTF-8 JSON.'}), 400
+    except Exception as exc:
+        log.warning('[Telegram Import] Upload read failed: %s', type(exc).__name__)
+        return jsonify({'ok': False, 'detail': 'Could not read the selected JSON file.'}), 400
+
+    if not isinstance(cfg, dict):
+        return jsonify({'ok': False, 'detail': 'Expected a JSON object with a destinations list.'}), 400
+    raw_items = cfg.get('destinations')
+    if not isinstance(raw_items, list):
+        raw_items = [cfg] if cfg.get('bot_token') or cfg.get('chat_id') else []
+    if cfg.get('enabled') is False:
+        raw_items = []
+
+    clean = []
+    skipped = 0
+    for item in raw_items:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        token = str(item.get('bot_token') or item.get('token') or '').strip()
+        chat_id = str(item.get('chat_id') or item.get('chatId') or '').strip()
+        if not token or not chat_id:
+            skipped += 1
+            continue
+        if len(token) > 512 or len(chat_id) > 256:
+            skipped += 1
+            continue
+        clean.append({
+            'name': str(item.get('name') or f'Telegram {len(clean) + 1}').strip()[:100],
+            'bot_token': token,
+            'chat_id': chat_id,
+            'enabled': bool(item.get('enabled', True)),
+        })
+    if not clean:
+        return jsonify({'ok': False, 'detail': 'No valid destinations found. Each destination needs bot_token and chat_id, and the top-level enabled flag must not be false.'}), 400
+
+    ok, detail = _save_telegram_config(clean)
+    if not ok:
+        return jsonify({'ok': False, 'detail': detail}), 500
+    return jsonify({'ok': True, 'detail': detail, 'imported': len(clean),
+                    'skipped': skipped, 'source_file': filename,
+                    'plaintext_file_saved': False})
 
 
 @app.route('/api/telegram/import-file', methods=['POST'])
