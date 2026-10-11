@@ -1,5 +1,6 @@
 Flask>=3.0,<4.0
 requests>=2.31,<3.0
 cryptography>=42.0.0,<47.0.0
+flask-sock>=0.7.0,<1.0.0
 psutil==7.0.0
 
