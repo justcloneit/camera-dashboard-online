@@ -18,7 +18,7 @@ Docker, Docker Compose, or a Linux VPS.
 
 ## Run directly
 ```bash
-python camera_dashboard.py --port 5000 --validation-batch 300
+python camera_dashboard.py --port 5000
 ```
 
 For hosted environments:
