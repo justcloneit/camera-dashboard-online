@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v168.0 — Single-File RTSP Camera Dashboard
+Camera Dashboard v169.0 — Single-File RTSP Camera Dashboard
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -94,7 +94,7 @@ except ImportError:
 try:
     from flask_sock import Sock
 except ImportError:
-    sys.exit('[!] flask-sock not found.  Run: pip install flask-sock')
+    sys.exit('[!] flask-sock not found. Install dependencies with: pip install -r requirements.txt (requires flask-sock)')
 try:
     import requests as _requests
 except ImportError:
@@ -105,7 +105,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '168.0'
+VERSION = '169.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
