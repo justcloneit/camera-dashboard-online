@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v169.0 — Single-File RTSP Camera Dashboard
+Camera Dashboard v170.0 — Single-File RTSP Camera Dashboard
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -105,7 +105,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '169.0'
+VERSION = '170.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -2432,7 +2432,18 @@ def _db_retry_write(fn, label='database write'):
             if is_background:
                 lock_acquired = _DB_WRITE_LOCK.acquire(timeout=0.20)
                 if not lock_acquired:
-                    if _shutdown_requested.wait(0.20): break
+                    # Record the actual contention cause. Previously this branch
+                    # retried without setting `last`, producing the misleading
+                    # final message `failed after 8 retries: None`.
+                    last = sqlite3.OperationalError(
+                        f'{label}: timed out waiting for the application SQLite write lock '
+                        f'(attempt {attempt + 1}/{_DB_BUSY_RETRIES})'
+                    )
+                    if attempt in (0, 3, 6):
+                        log.warning('[SQLite] %s waiting for application write lock; retry %d/%d',
+                                    label, attempt + 1, _DB_BUSY_RETRIES)
+                    if _shutdown_requested.wait(min(0.5, 0.15 * (attempt + 1))):
+                        break
                     continue
             else:
                 _DB_WRITE_LOCK.acquire(); lock_acquired=True
@@ -2982,6 +2993,18 @@ def _sync_advanced_metadata(cam):
     except Exception as exc:
         if _shutdown_requested.is_set() and 'cancelled during shutdown' in str(exc).lower():
             log.debug('Advanced metadata sync cancelled during shutdown')
+            return False
+        message = str(exc).lower()
+        if isinstance(exc, sqlite3.OperationalError) and (
+            'application sqlite write lock' in message or
+            'application write lock' in message or
+            'database is locked' in message or
+            'database is busy' in message
+        ):
+            # Background metadata is non-critical. Keep the item eligible for
+            # a later reconciliation cycle and avoid flooding Railway logs.
+            log.warning('Advanced metadata sync deferred due to SQLite contention (camera_id=%s): %s',
+                        _safe_str(cam.get('id')), exc)
             return False
         log.exception('advanced metadata sync failed')
         return False
