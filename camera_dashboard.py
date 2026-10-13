@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v170.0 — Single-File RTSP Camera Dashboard
+Camera Dashboard v175.0 — Single-File RTSP Camera Dashboard
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -42,6 +42,92 @@ import base64
 import statistics
 import secrets
 import random
+
+# ── Self-healing dependency bootstrap ─────────────────────────────────────────
+# The script remains deployable when a platform omits requirements.txt. It only
+# invokes pip when one or more required imports are missing.
+_REQUIRED_PYTHON_PACKAGES = (
+    ('flask', 'Flask'),
+    ('flask_sock', 'flask-sock'),
+    ('requests', 'requests'),
+    ('cryptography', 'cryptography'),
+)
+
+def _missing_required_packages():
+    import importlib.util
+    missing = []
+    for module_name, package_name in _REQUIRED_PYTHON_PACKAGES:
+        try:
+            available = importlib.util.find_spec(module_name) is not None
+        except (ImportError, ValueError, ModuleNotFoundError):
+            available = False
+        if not available:
+            missing.append((module_name, package_name))
+    return missing
+
+def _pip_install(arguments):
+    command = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check'] + list(arguments)
+    print('[Dependencies] Installing missing Python packages: ' + ' '.join(arguments), flush=True)
+    try:
+        result = subprocess.run(command, check=False)
+        return result.returncode == 0
+    except Exception as exc:
+        print(f'[Dependencies] pip invocation failed: {type(exc).__name__}: {exc}', flush=True)
+        return False
+
+def _ensure_required_packages():
+    missing = _missing_required_packages()
+    if not missing:
+        return
+
+    print('[Dependencies] Missing: ' + ', '.join(package for _, package in missing), flush=True)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    requirements_path = os.path.join(script_dir, 'requirements.txt')
+
+    # Prefer the deployment's supplied requirements file when available. If it
+    # is absent, unreadable, or incomplete, fall back to the embedded manifest.
+    installed_from_file = False
+    if os.path.isfile(requirements_path):
+        print(f'[Dependencies] Found {requirements_path}; trying it first.', flush=True)
+        installed_from_file = _pip_install(['-r', requirements_path])
+
+    missing = _missing_required_packages()
+    if missing:
+        fallback_packages = [package for _, package in missing]
+        if not _pip_install(fallback_packages):
+            # Some minimal Python images ship without pip. Try enabling it once.
+            try:
+                bootstrap = subprocess.run(
+                    [sys.executable, '-m', 'ensurepip', '--upgrade'],
+                    check=False,
+                )
+            except Exception:
+                bootstrap = None
+            if bootstrap is not None and bootstrap.returncode == 0:
+                _pip_install(fallback_packages)
+
+    missing = _missing_required_packages()
+    if missing:
+        names = ', '.join(package for _, package in missing)
+        reason = 'The platform may block package installation or have no internet access.'
+        raise SystemExit(
+            f'\n[Dependencies] ERROR: required packages still missing: {names}.\n'
+            f'Automatic installation failed. {reason}\n'
+            f'If your platform supports it, provide requirements.txt with: '
+            f'Flask, flask-sock, requests, cryptography. Then restart the app.'
+        )
+    print('[Dependencies] Required Python packages are ready.', flush=True)
+
+try:
+    _ensure_required_packages()
+except SystemExit:
+    raise
+except Exception as _dependency_bootstrap_error:
+    raise SystemExit(
+        f'[Dependencies] Automatic dependency setup failed: '
+        f'{type(_dependency_bootstrap_error).__name__}: {_dependency_bootstrap_error}'
+    )
+
 try:
     from cryptography.fernet import Fernet, InvalidToken
 except Exception:  # optional until Telegram secure storage is used
@@ -105,7 +191,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '170.0'
+VERSION = '175.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -1639,6 +1725,11 @@ _shutdown_started_at = None
 _SHUTDOWN_HARD_DEADLINE_SECONDS = max(10.0, float(os.getenv('CAMERA_SHUTDOWN_DEADLINE_SECONDS', '20')))
 _shutdown_watchdog = None
 _SHUTDOWN_FLUSH_LOCK = threading.Lock()
+# These primitives must exist before the Stop App worker or signal handler
+# invokes _tg_notify_shutdown_once(). They were missing in V170, causing a
+# NameError after the database flush had already completed.
+_TG_SHUTDOWN_SENT = threading.Event()
+_TG_SHUTDOWN_LOCK = threading.Lock()
 CLEAN_SHUTDOWN_MARKER = ''
 
 def _clean_shutdown_marker_path() -> str:
@@ -2205,6 +2296,9 @@ def _recover_database_if_needed(allow_create_if_missing: bool = False) -> None:
 
 _DB_WRITE_LOCK = threading.RLock()
 _DB_BACKUP_LOCK = threading.Lock()
+# Pause background writers during online backup so SQLite's backup API can finish
+# instead of repeatedly restarting its page copy while the live DB keeps changing.
+_DB_BACKUP_ACTIVE = threading.Event()
 _DB_MAINTENANCE_LOCK = threading.Lock()
 _DB_MAINTENANCE_ACTIVE = threading.Event()
 _DB_MAINTENANCE_STATE_LOCK = threading.Lock()
@@ -2266,7 +2360,8 @@ _DB_BACKGROUND_WRITE_INTERVAL = max(0.25, float(os.getenv('CAMERA_DB_BACKGROUND_
 _DB_UI_PRIORITY_WINDOW = max(0.50, float(os.getenv('CAMERA_DB_UI_PRIORITY_WINDOW', '2.00')))
 _DB_BACKGROUND_LABELS = (
     'validation', 'health', 'retention', 'audit', 'metadata', 'worker',
-    'recovery', 'scan history', 'inventory', 'backup', 'feature', 'discovery'
+    'recovery', 'scan history', 'inventory', 'backup', 'feature', 'discovery',
+    'bulk camera upsert'
 )
 _DB_BG_RATE_LOCK = threading.Lock()
 _DB_LAST_BACKGROUND_WRITE = 0.0
@@ -2290,6 +2385,9 @@ def _db_wait_background_slot(label):
     """Yield background DB writers so foreground dashboard actions stay responsive."""
     global _DB_LAST_BACKGROUND_WRITE
     while not _shutdown_requested.is_set():
+        if _DB_BACKUP_ACTIVE.is_set():
+            _shutdown_requested.wait(0.10)
+            continue
         now = time.monotonic()
         with _DB_BG_RATE_LOCK:
             wait_for = _DB_BACKGROUND_WRITE_INTERVAL - (now - _DB_LAST_BACKGROUND_WRITE)
@@ -2351,21 +2449,51 @@ class _V136SQLiteConnection(sqlite3.Connection):
     def _begin_write(self):
         if not self._v136_auto_writer_lock:
             _DB_WRITE_LOCK.acquire(); self._v136_auto_writer_lock=True
+    def _abort_auto_writer_lock(self):
+        # A failed direct write must not leave this thread holding the process-wide
+        # RLock indefinitely. Roll back the partial transaction before releasing it.
+        if self._v136_auto_writer_lock:
+            try:
+                super().rollback()
+            except Exception:
+                pass
+            self._v136_auto_writer_lock = False
+            try:
+                _DB_WRITE_LOCK.release()
+            except RuntimeError:
+                pass
     def execute(self,sql,parameters=()):
         if _v136_sql_is_write(sql): self._begin_write()
-        return super().execute(sql,parameters)
+        try:
+            return super().execute(sql,parameters)
+        except Exception:
+            self._abort_auto_writer_lock()
+            raise
     def executemany(self,sql,seq_of_parameters):
         if _v136_sql_is_write(sql): self._begin_write()
-        return super().executemany(sql,seq_of_parameters)
+        try:
+            return super().executemany(sql,seq_of_parameters)
+        except Exception:
+            self._abort_auto_writer_lock()
+            raise
     def executescript(self,sql_script):
         self._begin_write()
-        try: return super().executescript(sql_script)
+        try:
+            return super().executescript(sql_script)
+        except Exception:
+            self._abort_auto_writer_lock()
+            raise
         finally:
             if self._v136_auto_writer_lock:
                 self._v136_auto_writer_lock=False; _DB_WRITE_LOCK.release()
     def commit(self):
         auto=self._v136_auto_writer_lock
-        try: return super().commit()
+        try:
+            return super().commit()
+        except Exception:
+            try: super().rollback()
+            except Exception: pass
+            raise
         finally:
             if auto:
                 self._v136_auto_writer_lock=False; _DB_WRITE_LOCK.release()
@@ -2425,12 +2553,16 @@ def _db_retry_write(fn, label='database write'):
             is_background = _db_is_background_label(label)
             if is_background:
                 _db_wait_background_slot(label)
+                # Re-check after throttling: a backup may have started between the
+                # slot wait and lock acquisition.
+                while _DB_BACKUP_ACTIVE.is_set() and not _shutdown_requested.is_set():
+                    _shutdown_requested.wait(0.10)
                 if _shutdown_requested.is_set():
                     raise sqlite3.OperationalError(f'{label} cancelled during shutdown')
             started = time.monotonic()
             lock_acquired = False
             if is_background:
-                lock_acquired = _DB_WRITE_LOCK.acquire(timeout=0.20)
+                lock_acquired = _DB_WRITE_LOCK.acquire(timeout=0.50)
                 if not lock_acquired:
                     # Record the actual contention cause. Previously this branch
                     # retried without setting `last`, producing the misleading
@@ -2440,8 +2572,15 @@ def _db_retry_write(fn, label='database write'):
                         f'(attempt {attempt + 1}/{_DB_BUSY_RETRIES})'
                     )
                     if attempt in (0, 3, 6):
-                        log.warning('[SQLite] %s waiting for application write lock; retry %d/%d',
-                                    label, attempt + 1, _DB_BUSY_RETRIES)
+                        with _DB_WRITE_STATE_LOCK:
+                            writer_state = dict(_DB_WRITE_STATE)
+                        holder = str(writer_state.get('label') or 'untracked/direct lock holder')
+                        age = (max(0.0, time.monotonic() - float(writer_state.get('started') or 0.0))
+                               if writer_state.get('active') else 0.0)
+                        log.warning(
+                            '[SQLite] %s waiting for application write lock; retry %d/%d; '
+                            'tracked_holder=%s holder_age=%.2fs',
+                            label, attempt + 1, _DB_BUSY_RETRIES, holder, age)
                     if _shutdown_requested.wait(min(0.5, 0.15 * (attempt + 1))):
                         break
                     continue
@@ -2512,6 +2651,46 @@ def _cleanup_old_database_backups(keep: str = DB_BACKUPS[0]) -> list[str]:
     return removed
 
 
+def _cleanup_stale_backup_temp_files(min_age_seconds: float = 3600.0) -> list[str]:
+    """Remove orphaned SQLite backup temp files/sidecars older than one hour.
+
+    Current backup work is protected by _DB_BACKUP_LOCK and this age threshold;
+    live DB/WAL/SHM files and the persistent verified .bak are never touched.
+    """
+    removed = []
+    directory = os.path.dirname(DB_PATH) or '.'
+    prefix = os.path.basename(DB_PATH) + '.backup.'
+    cutoff = time.time() - max(60.0, float(min_age_seconds))
+    try:
+        for name in os.listdir(directory):
+            if not name.startswith(prefix) or '.tmp' not in name:
+                continue
+            path = os.path.join(directory, name)
+            try:
+                if not os.path.isfile(path) or os.path.getmtime(path) >= cutoff:
+                    continue
+                os.remove(path)
+                removed.append(path)
+            except OSError as exc:
+                log.warning('[SQLite] Could not remove stale backup temp %s: %s', name, exc)
+    except OSError as exc:
+        log.warning('[SQLite] Could not inspect backup temp files: %s', exc)
+    if removed:
+        log.info('[SQLite] Removed %d stale backup temp/sidecar file(s)', len(removed))
+    return removed
+
+
+def _remove_sqlite_temp_family(path: str) -> None:
+    """Remove a temporary database and all SQLite sidecars created beside it."""
+    for candidate in (path, path + '-wal', path + '-shm', path + '-journal'):
+        try:
+            os.remove(candidate)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning('[SQLite] Could not remove temporary file %s: %s', candidate, exc)
+
+
 def db_create_backup(clean_old: bool = True, _shutdown: bool = False) -> bool:
     """Create one verified SQLite backup and optionally remove legacy backups.
 
@@ -2532,6 +2711,17 @@ def db_create_backup(clean_old: bool = True, _shutdown: bool = False) -> bool:
         log.info('SQLite backup skipped: another backup is already running')
         return False
     try:
+        _DB_BACKUP_ACTIVE.set()
+        # Let any in-flight app writer finish before starting the snapshot, then
+        # pause background writes until the backup copy is published or aborted.
+        with _DB_WRITE_LOCK:
+            current = getattr(_db_local, 'conn', None)
+            if current is not None:
+                try: current.commit()
+                except Exception:
+                    try: current.rollback()
+                    except Exception: pass
+        _cleanup_stale_backup_temp_files()
         allowed, storage = _storage_allows_write(max(64*1024*1024, os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0), 'database backup')
         if not allowed: return False
         if not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) <= 0:
@@ -2545,8 +2735,6 @@ def db_create_backup(clean_old: bool = True, _shutdown: bool = False) -> bool:
         with _DB_WRITE_LOCK:
             current = getattr(_db_local, 'conn', None)
             if current is not None:
-                try: current.commit()
-                except Exception: current.rollback()
                 try: current.execute('PRAGMA wal_checkpoint(PASSIVE)')
                 except Exception: pass
         source = sqlite3.connect(DB_PATH, timeout=5.0, check_same_thread=False)
@@ -2562,13 +2750,20 @@ def db_create_backup(clean_old: bool = True, _shutdown: bool = False) -> bool:
         # and leave the last verified .bak untouched.
         backup_deadline = time.monotonic() + max(
             10.0,
-            float(os.getenv('CAMERA_BACKUP_TIMEOUT_SECONDS', '900'))
+            float(os.getenv('CAMERA_BACKUP_TIMEOUT_SECONDS', '1800'))
         )
+        last_progress_log = [time.monotonic()]
         def _backup_progress(status, remaining, total):
+            now = time.monotonic()
             if _shutdown_requested.is_set():
                 raise RuntimeError('backup cancelled: shutdown requested')
-            if time.monotonic() >= backup_deadline:
+            if now >= backup_deadline:
                 raise TimeoutError('SQLite backup deadline exceeded')
+            if now - last_progress_log[0] >= 60.0:
+                copied = max(0, int(total) - int(remaining))
+                log.info('[SQLite] Backup progress: %d/%d pages copied; %d remaining',
+                         copied, int(total), int(remaining))
+                last_progress_log[0] = now
         source.backup(dest, pages=1000, progress=_backup_progress, sleep=0.05)
         dest.commit(); dest.close(); dest=None
         # Do not run a second full integrity scan here. That doubled backup
@@ -2602,9 +2797,8 @@ def db_create_backup(clean_old: bool = True, _shutdown: bool = False) -> bool:
             except Exception: pass
         try: source.close()
         except Exception: pass
-        try: os.remove(tmp)
-        except FileNotFoundError: pass
-        except OSError: pass
+        _remove_sqlite_temp_family(tmp)
+        _DB_BACKUP_ACTIVE.clear()
         _DB_BACKUP_LOCK.release()
 
 
@@ -2664,9 +2858,19 @@ def db_compact_and_backup(actor: str = 'system') -> dict:
             conn = sqlite3.connect(DB_PATH, timeout=180, check_same_thread=False)
             try:
                 conn.execute('PRAGMA busy_timeout=180000')
-                conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                before_pages = int(conn.execute('PRAGMA page_count').fetchone()[0] or 0)
+                before_free = int(conn.execute('PRAGMA freelist_count').fetchone()[0] or 0)
+                checkpoint = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+                if checkpoint and int(checkpoint[0] or 0) != 0:
+                    raise sqlite3.OperationalError(
+                        f'WAL checkpoint is busy (busy={checkpoint[0]}, log_pages={checkpoint[1]}, checkpointed_pages={checkpoint[2]}); close other active requests and retry'
+                    )
                 conn.execute('VACUUM')
                 conn.commit()
+                after_pages = int(conn.execute('PRAGMA page_count').fetchone()[0] or 0)
+                after_free = int(conn.execute('PRAGMA freelist_count').fetchone()[0] or 0)
+                log.info('[DB Maintenance] Page audit: page_size=%s pages=%d->%d free_pages=%d->%d',
+                         conn.execute('PRAGMA page_size').fetchone()[0], before_pages, after_pages, before_free, after_free)
             finally:
                 conn.close()
 
@@ -2685,6 +2889,7 @@ def db_compact_and_backup(actor: str = 'system') -> dict:
                     'old_size': old_size, 'new_size': new_size}
 
         removed = _cleanup_old_database_backups(DB_BACKUPS[0])
+        removed_temp = _cleanup_stale_backup_temp_files(min_age_seconds=60.0)
         saved = max(0, old_size - new_size)
         pct = round((saved / old_size) * 100, 2) if old_size else 0.0
         log.info('[DB Maintenance] VACUUM complete: %d -> %d bytes (saved %d / %s%%); WAL %d -> %d bytes',
@@ -2703,6 +2908,7 @@ def db_compact_and_backup(actor: str = 'system') -> dict:
             'new_wal_bytes': new_wal,
             'backup': DB_BACKUPS[0],
             'removed_old_backups': len(removed),
+            'removed_stale_temp_files': len(removed_temp),
             'elapsed_seconds': round(time.monotonic() - started, 1),
             'maintenance': _db_maintenance_snapshot(),
         }
@@ -5285,9 +5491,15 @@ def _run_validation_cycle_impl(cameras: list[dict], max_workers: int | None = No
         _val_progress['speed_per_sec'] = round(total / elapsed, 2) if elapsed > 0 else 0.0
         _val_progress['eta_seconds'] = 0.0
     _touch_worker('validator', 'idle', scope)
-    stats = db_get_stats()
-    log.info('[Validator] Done in %.1fs — online=%d offline=%d',
-             elapsed, stats.get('online', 0), stats.get('offline', 0))
+    # Report counts from this validation cycle. Database-wide totals can be
+    # much larger than a claimed batch (e.g. 400 queued cameras), which made
+    # the previous completion log look internally inconsistent.
+    with _val_lock:
+        cycle_online = int(_val_progress.get('online', 0) or 0)
+        cycle_offline = int(_val_progress.get('offline', 0) or 0)
+        cycle_done = int(_val_progress.get('done', 0) or 0)
+    log.info('[Validator] Done in %.1fs — batch_done=%d/%d online=%d offline=%d',
+             elapsed, cycle_done, total, cycle_online, cycle_offline)
 
 
 def start_background_validation(cameras: list[dict], delay: float = 2.0,
@@ -6304,6 +6516,9 @@ dialog h2{margin-bottom:14px;font-size:16px;color:var(--accent)}
   {% if can_db %}<button class="btn" onclick="openSystemCenter()" title="Reliability, storage, scan and setup tools">🛠 System</button>
   <button class="btn" onclick="dashboardTool('maintenance')" title="Maintenance and retention cleanup">🧹 Maintenance</button>{% endif %}
   {% if can_db %}<button class="btn" onclick="shrinkDatabase()" title="Checkpoint WAL, VACUUM database and keep only the latest verified backup">🗜️ Shrink DB</button>{% endif %}
+  {% if can_db %}<button class="btn" onclick="exportUserConfig()" title="Export users and application settings only; no camera records">🔐 Export User/Config</button>
+  <button class="btn" onclick="document.getElementById('userConfigImportFile').click()" title="Import users and application settings only">📥 Import User/Config</button>
+  <input id="userConfigImportFile" type="file" accept="application/vnd.sqlite3,.sqlite,.db" style="display:none" onchange="importUserConfigFile(this)">{% endif %}
   {% if can_stream %}<button class="btn btn-primary" onclick="openMultiView(1)" title="1-camera live view">▦ 1</button>
   <button class="btn btn-primary" onclick="openMultiView(4)" title="4-camera live view">▦ 4</button>
   <button class="btn btn-primary" onclick="openMultiView(8)" title="8-camera live view">▦ 8</button>
@@ -7048,20 +7263,59 @@ async function refreshStats() {
 }
 
 // ── Refresh controls ──────────────────────────────────────────────────────────
+async function exportUserConfig() {
+  if (!confirm('Export user accounts, password hashes, application settings, API-key hashes and configured secrets (including Telegram bot tokens) to a sensitive SQLite file? Camera/device records are excluded. Store the file securely.')) return;
+  try {
+    const r = await fetch('/api/admin/user-config/export', {cache:'no-store'});
+    if (!r.ok) { const d = await r.json().catch(()=>({})); throw Error(d.detail || 'Export failed'); }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url;
+    a.download = 'camera_dashboard_user_config.sqlite'; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 30000);
+    showToast('✅ User/application configuration exported. Keep the file private.');
+  } catch (e) { showToast('❌ Export failed: ' + e.message, true); }
+}
+async function importUserConfigFile(input) {
+  const file = input && input.files && input.files[0]; if (!file) return;
+  if (!confirm('Import users and application settings from ' + file.name + '? Existing matching user/config entries may be updated. Camera/device data will not be imported. Only import a trusted SQLite file.')) { input.value=''; return; }
+  try {
+    const body = new FormData(); body.append('file', file);
+    const r = await fetch('/api/admin/user-config/import', {method:'POST', body});
+    const d = await r.json(); if (!r.ok || !d.ok) throw Error(d.detail || 'Import failed');
+    showToast('✅ Imported users/config only — users: ' + (d.imported_users||0) + ', settings: ' + (d.imported_settings||0) + ', other config rows: ' + (d.imported_other_rows||0) + '.');
+    setTimeout(()=>location.reload(), 1200);
+  } catch (e) { showToast('❌ Import failed: ' + e.message, true); }
+  finally { input.value=''; }
+}
+
 async function shrinkDatabase() {
   if (!confirm('Shrink the SQLite database now? Validation will pause, WAL will be checkpointed, VACUUM will reclaim unused space, and only the latest verified backup will be kept.')) return;
   const btn = [...document.querySelectorAll('header .btn')].find(b => b.textContent.includes('Shrink DB'));
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Shrinking…'; }
   try {
     const r = await fetch('/api/admin/shrink', {method:'POST'});
-    const d = await r.json();
-    if (d.running) {
-      showToast('⏳ DB shrink is already running — the existing operation will continue safely.');
-      return;
+    let d = await r.json();
+    if (!r.ok || !d.ok) throw Error(d.detail || 'Could not start database shrink');
+    // /api/admin/shrink starts a background job; it does not return the final
+    // byte counts. Poll the status endpoint instead of falsely reporting 0 MB.
+    const started = Date.now();
+    while (Date.now() - started < 60 * 60 * 1000) {
+      await new Promise(resolve => setTimeout(resolve, 2500));
+      const sr = await fetch('/api/admin/shrink/status', {cache:'no-store'});
+      d = await sr.json();
+      if (!sr.ok || !d.ok) throw Error(d.detail || 'Could not read database shrink status');
+      if (d.status === 'completed' || d.status === 'failed') break;
     }
-    if (!r.ok || !d.ok) throw Error(d.detail || 'Database shrink failed');
-    const saved = ((d.saved_bytes || 0) / 1048576).toFixed(1);
-    showToast('✅ DB shrink complete — saved ' + saved + ' MB; only latest backup kept.');
+    if (d.status === 'running') throw Error('Database shrink is still running. Open System → Storage to check its status; do not start another shrink.');
+    const result = d.result || {};
+    if (d.status !== 'completed' || !result.ok) throw Error(result.detail || d.error || 'Database shrink failed');
+    const saved = ((result.saved_bytes || 0) / 1048576).toFixed(1);
+    const oldMb = ((result.old_size || 0) / 1048576).toFixed(1);
+    const newMb = ((result.new_size || 0) / 1048576).toFixed(1);
+    showToast(saved === '0.0'
+      ? 'ℹ️ Shrink finished, but SQLite had no reclaimable pages: DB ' + oldMb + ' → ' + newMb + ' MB.'
+      : '✅ DB shrink complete — saved ' + saved + ' MB (' + oldMb + ' → ' + newMb + ' MB).');
   } catch (e) {
     showToast('❌ DB shrink failed: ' + e.message, true);
   } finally {
@@ -10170,6 +10424,381 @@ def api_admin_cleanup() -> Response:
         'removed_snapshots': removed_snapshots,
         'backup_created': backup_ok,
     })
+
+
+# A deliberately narrow export allowlist: no camera inventory, RTSP URLs, stream
+# observations, discovery queues, camera history, snapshots, or login sessions.
+_USER_CONFIG_TABLES = ('v43_auth_users', 'v43_user_roles', 'app_settings', 'api_keys',
+                       'alert_rules', 'scheduled_jobs', 'app_retention')
+_USER_CONFIG_FORMAT = 'camera-dashboard-user-config-v1'
+
+
+def _user_config_table_rows(conn, table):
+    allowed = set(_USER_CONFIG_TABLES)
+    if table not in allowed:
+        raise ValueError('Table is not allowed in user/config transfer')
+    exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    if not exists:
+        return []
+    columns = [str(r[1]) for r in conn.execute('PRAGMA table_info("' + table + '")').fetchall()]
+    # Never export session material or login/audit history, even if a future
+    # schema adds such columns to an allowlisted table.
+    rows = conn.execute('SELECT * FROM "' + table + '"').fetchall()
+    return [{k: row[k] for k in columns if k in row.keys()} for row in rows]
+
+
+@app.route('/api/admin/user-config/export', methods=['GET'])
+def api_export_user_config():
+    denied = _admin_only()
+    if denied: return denied
+    fd, out_path = tempfile.mkstemp(prefix='camera_dashboard_user_config_', suffix='.sqlite', dir=DATA_DIR)
+    os.close(fd)
+    try:
+        src = sqlite3.connect(DB_PATH, timeout=20)
+        src.row_factory = sqlite3.Row
+        dst = sqlite3.connect(out_path, timeout=20)
+        try:
+            dst.execute('PRAGMA journal_mode=DELETE')
+            dst.execute('PRAGMA synchronous=FULL')
+            dst.execute('PRAGMA foreign_keys=OFF')
+            dst.execute('''CREATE TABLE transfer_manifest(
+                format TEXT PRIMARY KEY, app_version TEXT NOT NULL,
+                exported_at TEXT NOT NULL, notice TEXT NOT NULL)''')
+            dst.execute('''CREATE TABLE transfer_telegram_destinations(
+                id INTEGER PRIMARY KEY CHECK(id=1), payload_json TEXT NOT NULL)''')
+            dst.execute('''CREATE TABLE transfer_background_services(
+                id INTEGER PRIMARY KEY CHECK(id=1), payload_json TEXT NOT NULL)''')
+            dst.execute('INSERT INTO transfer_manifest VALUES(?,?,?,?)', (
+                _USER_CONFIG_FORMAT, VERSION, utc_iso(),
+                'Sensitive user/application configuration only; camera/device records are excluded.'))
+
+            for table in _USER_CONFIG_TABLES:
+                schema = src.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                if not schema or not schema[0]:
+                    continue
+                # Reuse only the schema for explicitly allowlisted tables. No
+                # camera tables, triggers, views, indexes, or arbitrary SQL are copied.
+                dst.execute(schema[0])
+                cols = [str(r[1]) for r in src.execute('PRAGMA table_info("' + table + '")').fetchall()]
+                if not cols:
+                    continue
+                rows = src.execute('SELECT * FROM "' + table + '"').fetchall()
+                qcols = ','.join('"' + c + '"' for c in cols)
+                marks = ','.join('?' for _ in cols)
+                for row in rows:
+                    values = [row[c] for c in cols]
+                    # Telegram ciphertext uses the source host's local key and
+                    # cannot be decrypted on another host, so move it separately.
+                    if table == 'app_settings' and str(row['key']) == TG_DB_KEY:
+                        continue
+                    dst.execute('INSERT INTO "' + table + '" (' + qcols + ') VALUES (' + marks + ')', values)
+
+            telegram = _telegram_decrypt_config(include_disabled=True)
+            if not telegram:
+                telegram = _legacy_tg_file_destinations(include_disabled=True)
+            dst.execute('INSERT INTO transfer_telegram_destinations(id,payload_json) VALUES(1,?)',
+                        (json.dumps(telegram, ensure_ascii=False),))
+            services = {}
+            try:
+                if os.path.isfile(BACKGROUND_SERVICES_CONFIG_PATH):
+                    with open(BACKGROUND_SERVICES_CONFIG_PATH, 'r', encoding='utf-8') as fh:
+                        candidate = json.load(fh)
+                    if isinstance(candidate, dict): services = candidate
+            except Exception as exc:
+                log.warning('[UserConfig] Could not export background service settings: %s', exc)
+            dst.execute('INSERT INTO transfer_background_services(id,payload_json) VALUES(1,?)',
+                        (json.dumps(services, ensure_ascii=False),))
+            dst.execute('PRAGMA user_version=1')
+            dst.commit()
+        finally:
+            src.close()
+            dst.close()
+        with open(out_path, 'rb') as fh:
+            data = fh.read()
+        response = Response(data, mimetype='application/vnd.sqlite3')
+        response.headers['Content-Disposition'] = 'attachment; filename="camera_dashboard_user_config.sqlite"'
+        response.headers['Cache-Control'] = 'no-store, private'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Content-Length'] = str(len(data))
+        return response
+    except Exception as exc:
+        log.exception('[UserConfig] SQLite export failed')
+        return jsonify({'ok': False, 'detail': 'Export failed: ' + type(exc).__name__}), 500
+    finally:
+        _remove_sqlite_temp_family(out_path)
+
+
+def _import_user_config_database_file(source_path: str) -> dict:
+    """Safely merge an allowlisted user/config transfer file into the live DB.
+
+    This is shared by startup CLI imports and is intentionally independent of
+    Flask request authentication. Callers must explicitly select a trusted file.
+    Camera/device tables and all unapproved tables are rejected.
+    """
+    source_path = os.path.abspath(source_path)
+    live_path = os.path.abspath(DB_PATH)
+    if source_path == live_path:
+        raise ValueError('The transfer file cannot be the live camera database.')
+    if not os.path.isfile(source_path):
+        raise FileNotFoundError(source_path)
+    size = os.path.getsize(source_path)
+    if size <= 0 or size > 10 * 1024 * 1024:
+        raise ValueError('Transfer file must be between 1 byte and 10 MB.')
+    with open(source_path, 'rb') as fh:
+        if fh.read(16) != b'SQLite format 3\x00':
+            raise ValueError('File is not a valid SQLite database.')
+    uri = 'file:' + source_path.replace('\\', '/') + '?mode=ro'
+    source = sqlite3.connect(uri, uri=True, timeout=15)
+    source.row_factory = sqlite3.Row
+    try:
+        check = source.execute('PRAGMA quick_check').fetchone()
+        if not check or str(check[0]).lower() != 'ok':
+            raise ValueError('Transfer database failed SQLite integrity checking.')
+        names = {str(r[0]) for r in source.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if 'transfer_manifest' not in names:
+            raise ValueError('Transfer manifest is missing.')
+        manifest = source.execute('SELECT format FROM transfer_manifest LIMIT 1').fetchone()
+        if not manifest or manifest['format'] != _USER_CONFIG_FORMAT:
+            raise ValueError('Unsupported user/config transfer format.')
+        allowed_names = set(_USER_CONFIG_TABLES) | {
+            'transfer_manifest', 'transfer_telegram_destinations',
+            'transfer_background_services', 'sqlite_sequence'}
+        if names - allowed_names or 'cameras' in names:
+            raise ValueError('Transfer database contains unapproved tables; import refused.')
+
+        # Read optional configuration payloads before touching the live DB. If
+        # Telegram secrets exist but secure encryption is unavailable, preserve
+        # the transfer file and report a partial import rather than silently
+        # archiving the only copy of those secrets.
+        telegram = []
+        if 'transfer_telegram_destinations' in names:
+            row = source.execute('SELECT payload_json FROM transfer_telegram_destinations WHERE id=1').fetchone()
+            if row:
+                telegram = json.loads(row['payload_json'] or '[]')
+        services = {}
+        if 'transfer_background_services' in names:
+            row = source.execute('SELECT payload_json FROM transfer_background_services WHERE id=1').fetchone()
+            if row:
+                services = json.loads(row['payload_json'] or '{}')
+
+        imported_users = imported_settings = imported_other = 0
+        conn = _db_conn()
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            for table in _USER_CONFIG_TABLES:
+                if table not in names:
+                    continue
+                destination_exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                source_columns = [str(r[1]) for r in source.execute('PRAGMA table_info("' + table + '")').fetchall()]
+                dest_info = conn.execute('PRAGMA table_info("' + table + '")').fetchall() if destination_exists else []
+                if not dest_info or not source_columns:
+                    continue
+                dest_columns = [str(r[1]) for r in dest_info]
+                pk_cols = [str(r[1]) for r in sorted(dest_info, key=lambda r: int(r[5] or 0)) if int(r[5] or 0) > 0]
+                if table == 'api_keys' and 'name' in dest_columns:
+                    pk_cols = ['name']
+                if not pk_cols:
+                    continue
+                rows = source.execute('SELECT * FROM "' + table + '"').fetchall()
+                for row in rows:
+                    keys = [k for k in source_columns if k in dest_columns]
+                    if table == 'api_keys':
+                        keys = [k for k in keys if k != 'id']
+                    if not keys or not all(k in keys for k in pk_cols):
+                        continue
+                    vals = [row[k] for k in keys]
+                    if table == 'scheduled_jobs' and 'id' in keys and 'name' in keys:
+                        existing_job = conn.execute('SELECT id FROM scheduled_jobs WHERE name=?', (row['name'],)).fetchone()
+                        id_index = keys.index('id')
+                        if existing_job:
+                            vals[id_index] = existing_job['id']
+                        else:
+                            collision = conn.execute('SELECT name FROM scheduled_jobs WHERE id=?', (vals[id_index],)).fetchone()
+                            if collision and str(collision['name']) != str(row['name']):
+                                vals[id_index] = uuid.uuid4().hex
+                    marks = ','.join('?' for _ in keys)
+                    updates = [k for k in keys if k not in pk_cols]
+                    sql = 'INSERT INTO "' + table + '" (' + ','.join('"'+k+'"' for k in keys) + ') VALUES (' + marks + ')'
+                    if updates:
+                        sql += ' ON CONFLICT(' + ','.join('"'+k+'"' for k in pk_cols) + ') DO UPDATE SET ' + ','.join('"'+k+'"=excluded."'+k+'"' for k in updates)
+                    else:
+                        sql += ' ON CONFLICT(' + ','.join('"'+k+'"' for k in pk_cols) + ') DO NOTHING'
+                    conn.execute(sql, vals)
+                    if table == 'v43_auth_users': imported_users += 1
+                    elif table == 'app_settings': imported_settings += 1
+                    else: imported_other += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        telegram_imported = True
+        if isinstance(telegram, list) and telegram:
+            ok, detail = _save_telegram_config(telegram)
+            if not ok:
+                telegram_imported = False
+                log.error('[UserConfig] Telegram destinations were not imported: %s', detail)
+
+        services_imported = True
+        if isinstance(services, dict) and services:
+            tmp = BACKGROUND_SERVICES_CONFIG_PATH + '.import.tmp'
+            try:
+                with open(tmp, 'w', encoding='utf-8') as fh:
+                    json.dump(services, fh, ensure_ascii=False, indent=2)
+                    fh.flush(); os.fsync(fh.fileno())
+                os.replace(tmp, BACKGROUND_SERVICES_CONFIG_PATH)
+                # The preferences were loaded at module import time. Reload them
+                # now so imported ON/OFF choices take effect during this startup.
+                _load_persistent_background_service_states()
+            except Exception as exc:
+                try:
+                    if os.path.exists(tmp): os.unlink(tmp)
+                except OSError:
+                    pass
+                services_imported = False
+                log.warning('[UserConfig] Background service settings were not imported: %s', exc)
+        complete = bool(telegram_imported and services_imported)
+        if not complete:
+            log.warning('[UserConfig] Import is PARTIAL; source file must be retained and retried after fixing the missing configuration dependency/error.')
+        return {'ok': complete, 'complete': complete,
+                'telegram_imported': telegram_imported, 'services_imported': services_imported,
+                'imported_users': imported_users,
+                'imported_settings': imported_settings, 'imported_other_rows': imported_other}
+    finally:
+        source.close()
+
+
+@app.route('/api/admin/user-config/import', methods=['POST'])
+def api_import_user_config():
+    denied = _admin_only()
+    if denied: return denied
+    upload = request.files.get('file')
+    if not upload:
+        return jsonify({'ok': False, 'detail': 'Choose a user/config SQLite file first.'}), 400
+    fd, in_path = tempfile.mkstemp(prefix='camera_dashboard_user_config_import_', suffix='.sqlite', dir=DATA_DIR)
+    try:
+        total = 0
+        with os.fdopen(fd, 'wb') as fh:
+            while True:
+                chunk = upload.stream.read(1024 * 1024)
+                if not chunk: break
+                total += len(chunk)
+                if total > 10 * 1024 * 1024:
+                    return jsonify({'ok': False, 'detail': 'Import file exceeds the 10 MB limit.'}), 413
+                fh.write(chunk)
+            fh.flush(); os.fsync(fh.fileno())
+        with open(in_path, 'rb') as fh:
+            if fh.read(16) != b'SQLite format 3\x00':
+                return jsonify({'ok': False, 'detail': 'The selected file is not a valid SQLite database.'}), 400
+        uri = 'file:' + in_path.replace('\\', '/') + '?mode=ro'
+        source = sqlite3.connect(uri, uri=True, timeout=15)
+        source.row_factory = sqlite3.Row
+        try:
+            check = source.execute('PRAGMA quick_check').fetchone()
+            if not check or str(check[0]).lower() != 'ok':
+                return jsonify({'ok': False, 'detail': 'The transfer database failed SQLite integrity checking.'}), 400
+            names = {str(r[0]) for r in source.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if 'transfer_manifest' not in names:
+                return jsonify({'ok': False, 'detail': 'Transfer manifest is missing; choose an exported user/config database.'}), 400
+            manifest = source.execute('SELECT format FROM transfer_manifest LIMIT 1').fetchone()
+            if not manifest or manifest['format'] != _USER_CONFIG_FORMAT:
+                return jsonify({'ok': False, 'detail': 'Unsupported user/config transfer format.'}), 400
+            unexpected = names - set(_USER_CONFIG_TABLES) - {
+                'transfer_manifest', 'transfer_telegram_destinations', 'transfer_background_services', 'sqlite_sequence'}
+            if unexpected or 'cameras' in names:
+                return jsonify({'ok': False, 'detail': 'Transfer database contains unapproved tables; import refused.'}), 400
+
+            imported_users = imported_settings = imported_other = 0
+            conn = _db_conn()
+            conn.execute('BEGIN IMMEDIATE')
+            try:
+                for table in _USER_CONFIG_TABLES:
+                    if table not in names:
+                        continue
+                    destination_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                    source_columns = [str(r[1]) for r in source.execute('PRAGMA table_info("' + table + '")').fetchall()]
+                    dest_info = conn.execute('PRAGMA table_info("' + table + '")').fetchall() if destination_exists else []
+                    if not dest_info or not source_columns:
+                        continue
+                    dest_columns = [str(r[1]) for r in dest_info]
+                    pk_cols = [str(r[1]) for r in sorted(dest_info, key=lambda r: int(r[5] or 0)) if int(r[5] or 0) > 0]
+                    if table == 'api_keys' and 'name' in dest_columns:
+                        pk_cols = ['name']
+                    if not pk_cols:
+                        continue
+                    rows = source.execute('SELECT * FROM "' + table + '"').fetchall()
+                    for row in rows:
+                        keys = [k for k in source_columns if k in dest_columns]
+                        if table == 'api_keys': keys = [k for k in keys if k != 'id']
+                        if not keys or not all(k in keys for k in pk_cols): continue
+                        vals = [row[k] for k in keys]
+                        # Scheduled jobs have both an ID primary key and a unique
+                        # name. Reuse the local ID for an existing name; if a new
+                        # imported ID collides with a different local job, assign
+                        # a fresh ID instead of aborting the whole transfer.
+                        if table == 'scheduled_jobs' and 'id' in keys and 'name' in keys:
+                            name_value = row['name']
+                            existing_job = conn.execute('SELECT id FROM scheduled_jobs WHERE name=?', (name_value,)).fetchone()
+                            id_index = keys.index('id')
+                            if existing_job:
+                                vals[id_index] = existing_job['id']
+                            else:
+                                id_collision = conn.execute('SELECT name FROM scheduled_jobs WHERE id=?', (vals[id_index],)).fetchone()
+                                if id_collision and str(id_collision['name']) != str(name_value):
+                                    vals[id_index] = uuid.uuid4().hex
+                        marks = ','.join('?' for _ in keys)
+                        updates = [k for k in keys if k not in pk_cols]
+                        sql = 'INSERT INTO "' + table + '" (' + ','.join('"'+k+'"' for k in keys) + ') VALUES (' + marks + ')'
+                        if updates:
+                            sql += ' ON CONFLICT(' + ','.join('"'+k+'"' for k in pk_cols) + ') DO UPDATE SET ' + ','.join('"'+k+'"=excluded."'+k+'"' for k in updates)
+                        else:
+                            sql += ' ON CONFLICT(' + ','.join('"'+k+'"' for k in pk_cols) + ') DO NOTHING'
+                        conn.execute(sql, vals)
+                        if table == 'v43_auth_users': imported_users += 1
+                        elif table == 'app_settings': imported_settings += 1
+                        else: imported_other += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+            telegram = []
+            if 'transfer_telegram_destinations' in names:
+                row = source.execute('SELECT payload_json FROM transfer_telegram_destinations WHERE id=1').fetchone()
+                if row:
+                    telegram = json.loads(row['payload_json'] or '[]')
+            if isinstance(telegram, list) and telegram:
+                ok, detail = _save_telegram_config(telegram)
+                if not ok:
+                    log.error('[UserConfig] Telegram destinations were not imported: %s', detail)
+
+            services = {}
+            if 'transfer_background_services' in names:
+                row = source.execute('SELECT payload_json FROM transfer_background_services WHERE id=1').fetchone()
+                if row: services = json.loads(row['payload_json'] or '{}')
+            if isinstance(services, dict) and services:
+                try:
+                    tmp = BACKGROUND_SERVICES_CONFIG_PATH + '.import.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as fh:
+                        json.dump(services, fh, ensure_ascii=False, indent=2)
+                        fh.flush(); os.fsync(fh.fileno())
+                    os.replace(tmp, BACKGROUND_SERVICES_CONFIG_PATH)
+                except Exception as exc:
+                    log.warning('[UserConfig] Background service settings were not imported: %s', exc)
+            return jsonify({'ok': True, 'imported_users': imported_users,
+                            'imported_settings': imported_settings, 'imported_other_rows': imported_other,
+                            'detail': 'Imported allowlisted user/application settings only. Camera/device records, sessions, and validation history were excluded.'})
+        finally:
+            source.close()
+    except (sqlite3.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        log.exception('[UserConfig] SQLite import rejected')
+        return jsonify({'ok': False, 'detail': 'Invalid user/config database: ' + str(exc)[:250]}), 400
+    except Exception as exc:
+        log.exception('[UserConfig] SQLite import failed')
+        return jsonify({'ok': False, 'detail': 'Import failed: ' + type(exc).__name__}), 500
+    finally:
+        _remove_sqlite_temp_family(in_path)
 
 
 _DB_SHRINK_JOB_LOCK=threading.RLock()
@@ -15128,6 +15757,10 @@ def main() -> None:
                         help='Validation queue batch size: 0=automatic, 1-10000')
     parser.add_argument('--max-streams', type=int, default=MAX_STREAMS,
                         help='Maximum simultaneous live feeds: 1-256')
+    parser.add_argument('--import-user-config', nargs='?', const='__DEFAULT__', default=None, metavar='PATH',
+                        help='Import a trusted user/config SQLite file during startup (no camera data). Without PATH, uses camera_dashboard_user_config.sqlite in --data-dir.')
+    parser.add_argument('--no-auto-import-user-config', action='store_true',
+                        help='Disable automatic import of camera_dashboard_user_config.sqlite when present in --data-dir.')
     parser.add_argument('--create-db-if-missing', action='store_true',
                         help='Create a fresh SQLite database only when the live DB is missing and no verified backup exists; never replace a corrupt existing DB.')
     args = parser.parse_args()
@@ -15183,6 +15816,45 @@ def main() -> None:
     _ensure_tg_template()
     db_init(allow_create_if_missing=bool(args.create_db_if_missing))
     _v43_ensure_schema()
+    # Optional one-time import: explicit --import-user-config PATH always wins;
+    # otherwise import the standard file when present unless auto-import is disabled.
+    default_transfer = os.path.join(DATA_DIR, 'camera_dashboard_user_config.sqlite')
+    explicit_transfer = args.import_user_config is not None
+    if explicit_transfer:
+        transfer_path = default_transfer if args.import_user_config == '__DEFAULT__' else os.path.abspath(args.import_user_config)
+    elif not args.no_auto_import_user_config and os.path.isfile(default_transfer):
+        transfer_path = default_transfer
+    else:
+        transfer_path = None
+    if transfer_path:
+        try:
+            log.info('[UserConfig] Startup import requested from %s', transfer_path)
+            import_result = _import_user_config_database_file(transfer_path)
+            log.info('[UserConfig] Startup import %s: users=%d settings=%d other_config_rows=%d telegram=%s services=%s',
+                     'completed' if import_result.get('complete', True) else 'PARTIAL',
+                     import_result['imported_users'], import_result['imported_settings'],
+                     import_result['imported_other_rows'],
+                     'ok' if import_result.get('telegram_imported', True) else 'not-imported',
+                     'ok' if import_result.get('services_imported', True) else 'not-imported')
+            # Never archive a source transfer while any included configuration
+            # failed to import. It remains available for a dependency/key fix.
+            if import_result.get('complete', True) and not explicit_transfer and os.path.abspath(transfer_path) == os.path.abspath(default_transfer):
+                archived = default_transfer + '.imported.' + datetime.now().strftime('%Y%m%d_%H%M%S')
+                try:
+                    os.replace(default_transfer, archived)
+                    log.info('[UserConfig] Imported file archived as %s to prevent repeated startup imports', archived)
+                except OSError as archive_exc:
+                    log.warning('[UserConfig] Import succeeded but source file could not be archived: %s', archive_exc)
+        except FileNotFoundError:
+            if explicit_transfer:
+                raise RuntimeError('User/config transfer file not found: ' + transfer_path)
+            log.info('[UserConfig] No default transfer file present; startup import skipped')
+        except Exception as import_exc:
+            log.exception('[UserConfig] Startup import failed; existing database was not replaced')
+            if explicit_transfer:
+                raise RuntimeError('User/config startup import failed: ' + str(import_exc)[:300]) from import_exc
+            # Automatic import is best-effort: keep the server available and leave
+            # the original file in place for operator inspection/retry.
     # Install signal handling before background workers start so SIGTERM/SIGINT
     # cannot arrive during startup before the graceful-shutdown barrier exists.
     _install_shutdown_signal_handlers()
@@ -15377,7 +16049,11 @@ def main() -> None:
     print(f'  Scan dir  : {_SEARCH_DIR}')
     print(f'  Database  : {DB_PATH}')
     print(f'  Snapshots : {SNAPSHOT_DIR}')
-    print(f'  Telegram  : {"✓ encrypted config" if _load_tg_destinations() else "✗ not configured — use Telegram button"}')
+    if Fernet is None:
+        telegram_banner = '✗ cryptography missing — secure Telegram import disabled'
+    else:
+        telegram_banner = '✓ encrypted config' if _load_tg_destinations() else '✗ not configured — use Telegram button'
+    print(f'  Telegram  : {telegram_banner}')
     print(f'{"─" * 64}')
     print(f'  🌐  Open  : http://{args.host}:{args.port}')
     print(f'  ❤️  Health : http://{args.host}:{args.port}/healthz')
@@ -15529,7 +16205,7 @@ def v110_camera_notes(cam_id):
 @app.route('/system-center')
 def v110_system_center():
     if _auth_enabled() and not _session_valid(): return redirect(url_for('login',next='/system-center'))
-    html = """<!doctype html><html><head><meta charset='utf-8'><meta name='csrf-token' content='__CSRF_TOKEN__'><title>Camera Dashboard System Center</title><style>body{font:14px Arial;background:#111820;color:#ddd;margin:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}.card{border:1px solid #39434e;background:#171e27;border-radius:8px;padding:14px}button{background:#243447;color:#fff;border:1px solid #506070;border-radius:5px;padding:7px 10px;margin:3px;cursor:pointer}pre{white-space:pre-wrap;max-height:360px;overflow:auto}</style></head><body><h2>🛠 Camera Dashboard — System Center</h2><div class='grid'><div class='card'><h3>Storage / Database</h3><pre id='health'>Loading…</pre><button onclick='load()'>Refresh</button><button onclick='backup()'>Create Backup</button><button onclick='shrink()'>Shrink DB</button></div><div class='card'><h3>Scan controls</h3><pre id='scan'>Loading…</pre><button onclick='scan("pause")'>Pause</button><button onclick='scan("resume")'>Resume</button><button onclick='scan("cancel")'>Cancel</button><button onclick='scan("full-rescan")'>Full Rescan</button></div><div class='card'><h3>Setup / Support</h3><pre id='setup'>Loading…</pre><button onclick='diag()'>Diagnostic Bundle</button></div></div><script>const __csrf=document.querySelector('meta[name=csrf-token]')?.content||'';async function j(u,o){o=o||{};o.headers=new Headers(o.headers||{});if(/^(POST|PUT|PATCH|DELETE)$/i.test(o.method||'GET'))o.headers.set('X-CSRF-Token',__csrf);let r=await fetch(u,o);return await r.json()}async function load(){let x=await j('/api/v110/health');document.querySelector('#health').textContent=JSON.stringify(x,null,2);let s=await j('/api/v110/scan/status');document.querySelector('#scan').textContent=JSON.stringify(s,null,2);let q=await j('/api/v110/setup/check');document.querySelector('#setup').textContent=JSON.stringify(q,null,2)}async function scan(a){await j('/api/v110/scan/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});load()}async function backup(){await j('/api/v110/backup/create',{method:'POST'});load()}async function shrink(){await j('/api/v110/maintenance/shrink',{method:'POST'});load()}async function diag(){let x=await j('/api/v110/diagnostics/bundle');alert(x.ok?'Created: '+x.name:x.detail)}load();setInterval(load,3000)</script></body></html>""".replace('__CSRF_TOKEN__', _csrf_token())
+    html = """<!doctype html><html><head><meta charset='utf-8'><meta name='csrf-token' content='__CSRF_TOKEN__'><title>Camera Dashboard System Center</title><style>body{font:14px Arial;background:#111820;color:#ddd;margin:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}.card{border:1px solid #39434e;background:#171e27;border-radius:8px;padding:14px}button{background:#243447;color:#fff;border:1px solid #506070;border-radius:5px;padding:7px 10px;margin:3px;cursor:pointer}pre{white-space:pre-wrap;max-height:360px;overflow:auto}</style></head><body><h2>🛠 Camera Dashboard — System Center</h2><div class='grid'><div class='card'><h3>Storage / Database</h3><pre id='health'>Loading…</pre><button onclick='load()'>Refresh</button><button onclick='backup()'>Create Backup</button><button onclick='shrink()'>Shrink DB</button><button onclick='exportCfg()'>Export User/Config</button><button onclick='document.querySelector("#cfgfile").click()'>Import User/Config</button><input id='cfgfile' type='file' accept='application/vnd.sqlite3,.sqlite,.db' style='display:none' onchange='importCfg(this)'></div><div class='card'><h3>Scan controls</h3><pre id='scan'>Loading…</pre><button onclick='scan("pause")'>Pause</button><button onclick='scan("resume")'>Resume</button><button onclick='scan("cancel")'>Cancel</button><button onclick='scan("full-rescan")'>Full Rescan</button></div><div class='card'><h3>Setup / Support</h3><pre id='setup'>Loading…</pre><button onclick='diag()'>Diagnostic Bundle</button></div></div><script>const __csrf=document.querySelector('meta[name=csrf-token]')?.content||'';async function j(u,o){o=o||{};o.headers=new Headers(o.headers||{});if(/^(POST|PUT|PATCH|DELETE)$/i.test(o.method||'GET'))o.headers.set('X-CSRF-Token',__csrf);let r=await fetch(u,o);return await r.json()}async function load(){let x=await j('/api/v110/health');document.querySelector('#health').textContent=JSON.stringify(x,null,2);let s=await j('/api/v110/scan/status');document.querySelector('#scan').textContent=JSON.stringify(s,null,2);let q=await j('/api/v110/setup/check');document.querySelector('#setup').textContent=JSON.stringify(q,null,2)}async function scan(a){await j('/api/v110/scan/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});load()}async function backup(){await j('/api/v110/backup/create',{method:'POST'});load()}async function shrink(){if(!confirm('Shrink SQLite now? This may take time and pauses validation.'))return;let x=await j('/api/admin/shrink',{method:'POST'});if(!x.ok)throw Error(x.detail||'Could not start shrink');for(let i=0;i<1440;i++){await new Promise(r=>setTimeout(r,2500));x=await j('/api/admin/shrink/status');if(x.status==='completed'||x.status==='failed')break;}if(x.status==='completed'&&x.result?.ok)alert('Shrink finished. Saved '+((x.result.saved_bytes||0)/1048576).toFixed(1)+' MB; DB '+((x.result.old_size||0)/1048576).toFixed(1)+' → '+((x.result.new_size||0)/1048576).toFixed(1)+' MB.');else alert('Shrink: '+(x.result?.detail||x.status||'unknown status'));load()}async function exportCfg(){if(!confirm('Export sensitive user/config data and secrets? No camera data is included. Keep the file private.'))return;location.href='/api/admin/user-config/export'}async function importCfg(el){if(!el.files?.[0])return;if(!confirm('Import a trusted user/config SQLite database? Matching settings/users may be updated. No cameras are imported.')){el.value='';return}let f=new FormData();f.append('file',el.files[0]);let x=await j('/api/admin/user-config/import',{method:'POST',body:f});alert(x.detail||JSON.stringify(x));el.value='';load()}async function diag(){let x=await j('/api/v110/diagnostics/bundle');alert(x.ok?'Created: '+x.name:x.detail)}load();setInterval(load,3000)</script></body></html>""".replace('__CSRF_TOKEN__', _csrf_token())
     return Response(html,mimetype='text/html')
 
 @app.errorhandler(404)
