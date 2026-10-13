@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v178.0 — Single-File RTSP Camera Dashboard
+Camera Dashboard v179.0 — Single-File RTSP Camera Dashboard
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -191,7 +191,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '178.0'
+VERSION = '179.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -6267,6 +6267,7 @@ _HTML_CAM_GRID = r"""
       <button class="btn"            data-action="snap"  data-id="{{ cam.id }}">&#128247; Snap</button>
       <button class="btn"            data-action="tg"    data-id="{{ cam.id }}">&#10148; TG</button>
       {% endif %}
+      <button class="btn" data-action="geo-lookup" data-id="{{ cam.id }}" title="Look up approximate public-IP location and save city/region/country">🌍 Lookup Location</button>
       <button class="btn btn-primary" data-action="intel" data-id="{{ cam.id }}" title="On-demand NVR/DVR status, storage, users, playback and location">🖥 Device Intel</button>
       <button class="btn btn-primary" data-action="detect-feed" data-id="{{ cam.id }}" title="Detect an authenticated RTSP feed for this camera/door camera">📡 Detect Feed</button>
       {% if cam.web_url %}<a class="btn" href="{{ cam.web_url | e }}" target="_blank" rel="noopener">&#127760;</a>{% endif %}
@@ -6957,6 +6958,7 @@ async function doAction(act, id, card) {
     case 'tg':    sendTelegram(id); break;
     case 'device': openDeviceDetails(id); break;
     case 'intel': openDeviceIntel(id); break;
+    case 'geo-lookup': lookupCameraLocation(id); break;
   }
 }
 
@@ -8135,20 +8137,34 @@ async function runDeviceIntel(section) {
     out.textContent = JSON.stringify(d.data || d, null, 2);
   } catch (e) { status.textContent = 'Request failed: ' + (e?.message || e); }
 }
-async function lookupDeviceLocation() {
-  const status = document.getElementById('device-intel-status');
-  const out = document.getElementById('device-intel-result');
-  if (!activeIntelCameraId) return;
-  status.textContent = 'Looking up approximate public-IP location (multiple HTTPS providers)…';
+async function lookupCameraLocation(cameraId) {
+  const id = cameraId || activeIntelCameraId;
+  if (!id) return;
+  const card = document.querySelector('.cam-card[data-id="' + CSS.escape(id) + '"]');
+  const button = card?.querySelector('[data-action="geo-lookup"]');
+  if (button) { button.disabled = true; button.dataset.originalText = button.textContent; button.textContent = '🌍 Looking…'; }
   try {
-    const r = await fetch('/api/cameras/' + encodeURIComponent(activeIntelCameraId) + '/geo-update', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'lookup'})});
+    const r = await fetch('/api/cameras/' + encodeURIComponent(id) + '/geo-update', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mode:'lookup'})
+    });
     const d = await r.json();
     if (!r.ok || !d.ok) throw Error(d.detail || ('HTTP ' + r.status));
-    status.textContent = d.updated ? 'Location looked up and saved. IP geolocation is approximate, not GPS.' : (d.detail || 'No reliable location returned; use Edit / Save Location.');
-    out.textContent = JSON.stringify(d, null, 2);
-    if (d.updated) setTimeout(() => location.reload(), 1200);
-  } catch (e) { status.textContent = 'Location lookup failed: ' + (e?.message || e); }
+    if (d.updated) {
+      showToast('📍 Location saved: ' + [d.geo?.city, d.geo?.region, d.geo?.country].filter(Boolean).join(', '));
+      setTimeout(() => location.reload(), 900);
+    } else {
+      showToast('Location not updated: ' + (d.detail || 'No usable public-IP location returned.'), true);
+    }
+    if (activeIntelCameraId === id) {
+      const status = document.getElementById('device-intel-status');
+      const out = document.getElementById('device-intel-result');
+      if (status) status.textContent = d.updated ? 'Location saved. IP geolocation is approximate, not GPS.' : (d.detail || 'No reliable location returned; use Edit / Save Location.');
+      if (out) out.textContent = JSON.stringify(d, null, 2);
+    }
+  } catch (e) { showToast('Location lookup failed: ' + (e?.message || e), true); }
+  finally { if (button) { button.disabled = false; button.textContent = button.dataset.originalText || '🌍 Lookup Location'; } }
 }
+async function lookupDeviceLocation() { return lookupCameraLocation(activeIntelCameraId); }
 async function editDeviceLocation() {
   if (!activeIntelCameraId) return;
   const card = document.querySelector('.cam-card[data-id="' + CSS.escape(activeIntelCameraId) + '"]');
