@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v177.0 — Single-File RTSP Camera Dashboard
+Camera Dashboard v178.0 — Single-File RTSP Camera Dashboard
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -191,7 +191,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '177.0'
+VERSION = '178.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -4222,6 +4222,8 @@ def _db_get_group_stats_uncached() -> list[dict]:
         params.extend([user, user])
     rows = c.execute(f'''
         SELECT COALESCE(NULLIF(c.group_name,''), NULLIF(c.country,''), 'Unknown') AS display_group,
+               MAX(NULLIF(c.area,'')) AS area, MAX(NULLIF(c.city,'')) AS city,
+               MAX(NULLIF(c.region,'')) AS region, MAX(NULLIF(c.country,'')) AS country,
                COUNT(*) AS total, SUM(c.status='online') AS online, SUM(c.status='offline') AS offline,
                SUM(c.status='checking') AS checking, SUM(c.status='unknown') AS unknown,
                SUM(c.favorite=1) AS favorites, MIN(c.source_file) AS sample_source, MAX(c.last_seen) AS last_active
@@ -4233,6 +4235,16 @@ def _db_get_group_stats_uncached() -> list[dict]:
         d=dict(r)
         for k,v in d.items():
             if isinstance(v,str): d[k]=_safe_str(v)
+        # Replace placeholder category prefixes such as "XX - Hikvision - IP:port"
+        # with the best saved geographic label while preserving the original group key.
+        raw_group = _safe_str(d.get('display_group') or '')
+        location_parts = [d.get(k) for k in ('area', 'city', 'region', 'country')]
+        location_parts = list(dict.fromkeys(_safe_str(x).strip() for x in location_parts if _safe_str(x).strip()))
+        location_label = ', '.join(location_parts)
+        if re.match(r'^XX(?:\s|[-_:·]|$)', raw_group, re.I) and location_label:
+            d['display_title'] = location_label + re.sub(r'^XX', '', raw_group, count=1, flags=re.I)
+        else:
+            d['display_title'] = raw_group or location_label or 'Unknown location'
         out.append(d)
     return out
 
@@ -6680,7 +6692,7 @@ dialog h2{margin-bottom:14px;font-size:16px;color:var(--accent)}
      data-loaded="{% if loop.first %}loading{% else %}false{% endif %}">
   <div class="section-header" onclick="toggleSection(this)">
     <span class="chevron">▶</span>
-    <h2>{% if loop.first %}⭐ {% endif %}{{ g.display_group | e }}</h2>
+    <h2>{% if loop.first %}⭐ {% endif %}{{ (g.display_title or g.display_group) | e }}</h2>
     <div class="sec-mini">
       {% if g.online %}<span style="color:#3fb950">🟢{{ g.online }}</span>{% endif %}
       {% if g.checking %}<span style="color:#d29922">🟡{{ g.checking }}</span>{% endif %}
@@ -9627,7 +9639,7 @@ def _device_geo(host: str, enabled: bool = False) -> dict:
     for provider, url in providers:
         try:
             response = _requests.get(url, timeout=(2.5, 3.5),
-                                     headers={'User-Agent': 'CameraDashboard/177.0'})
+                                     headers={'User-Agent': 'CameraDashboard/178.0'})
             if not response.ok:
                 failures.append(f'{provider}: HTTP {response.status_code}')
                 continue
