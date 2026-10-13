@@ -8,7 +8,6 @@ Usage:
     python3 camera_dashboard.py [--port $PORT] [--host 0.0.0.0] [--dir .]
     camera_dashboard.exe
 """
-
 # ── Standard library ──────────────────────────────────────────────────────────
 import argparse
 import atexit
