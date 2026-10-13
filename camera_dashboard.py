@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v175.0 — Single-File RTSP Camera Dashboard
+Camera Dashboard v177.0 — Single-File RTSP Camera Dashboard
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -8,6 +8,7 @@ Usage:
     python3 camera_dashboard.py [--port $PORT] [--host 0.0.0.0] [--dir .]
     camera_dashboard.exe
 """
+
 # ── Standard library ──────────────────────────────────────────────────────────
 import argparse
 import atexit
@@ -190,7 +191,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '175.0'
+VERSION = '177.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -3808,7 +3809,9 @@ def db_bulk_upsert(cameras: list[dict]) -> int:
         merged=previous+[u for u in incoming if u not in previous]
         rows.append((cid,cam.get('label',''),cam.get('ip',''),cam.get('port',80),cam.get('camera_type',''),cam.get('username',''),cam.get('password',''),cam.get('country',''),cam.get('region',''),cam.get('city',''),json.dumps(merged),cam.get('web_url',''),cam.get('source_file',''),cam.get('group_name',cam.get('country','')),cam.get('device_id',''),int(cam.get('channel_index') or 0),cam.get('channel_name',''),cam.get('geo_source',''),cam.get('geo_confidence','')))
         memberships.append((cam.get('source_file',''),cid) if cam.get('source_file') else None)
-        queued.append((cid,_validation_priority(cam),VALIDATION_MAX_ATTEMPTS))
+        has_new_candidate = any(url not in previous for url in incoming)
+        queue_priority = 0 if has_new_candidate else _validation_priority(cam)
+        queued.append((cid,queue_priority,VALIDATION_MAX_ATTEMPTS,int(has_new_candidate)))
     upsert_sql = '''
         INSERT INTO cameras (id,label,ip,port,camera_type,username,password,country,region,city,rtsp_urls,web_url,source_file,group_name,device_id,channel_index,channel_name,geo_source,geo_confidence)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -3831,7 +3834,7 @@ def db_bulk_upsert(cameras: list[dict]) -> int:
             deleted=0, deleted_at=NULL, updated_at=datetime('now')
     '''
     member_sql = '''INSERT INTO discovery_members(source_path,camera_id,last_seen) VALUES (?, ?, datetime('now')) ON CONFLICT(source_path,camera_id) DO UPDATE SET last_seen=datetime('now')'''
-    queue_sql = '''INSERT INTO validation_queue(camera_id,priority,next_attempt,max_attempts) VALUES (?, ?, datetime('now'), ?) ON CONFLICT(camera_id) DO UPDATE SET priority=CASE WHEN excluded.priority < validation_queue.priority THEN excluded.priority ELSE validation_queue.priority END,max_attempts=MIN(validation_queue.max_attempts,excluded.max_attempts)'''
+    queue_sql = '''INSERT INTO validation_queue(camera_id,priority,next_attempt,max_attempts) VALUES (?, ?, datetime('now'), ?) ON CONFLICT(camera_id) DO UPDATE SET priority=MIN(validation_queue.priority,excluded.priority),next_attempt=CASE WHEN ?=1 OR excluded.priority < validation_queue.priority THEN datetime('now') ELSE validation_queue.next_attempt END,max_attempts=MIN(validation_queue.max_attempts,excluded.max_attempts)'''
     # v136: commit each small discovery chunk independently.
     for pos in range(0, len(rows), chunk_size):
         end=min(pos+chunk_size,len(rows))
@@ -4979,24 +4982,63 @@ _last_discovery_members: dict[str, set[str]] = {}
 def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collect: bool = True) -> list[dict]:
     cameras: list[dict] = []
     seen_ids: set        = set()
-    root = Path(search_dir)
+    root = Path(search_dir).resolve()
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f'Camera discovery directory is missing or not a directory: {root}')
     source_members: dict[str, set[str]] = {}
     current_sources: set[str] = set()
     pending_records=[]
 
     pending_batch = []
+    last_batch_flush = time.monotonic()
+    def flush_batch(force: bool = False):
+        nonlocal last_batch_flush
+        if not on_batch or not pending_batch:
+            return
+        now = time.monotonic()
+        # Flush by size or at least every two seconds; do not wait for the
+        # entire workspace traversal to finish before adding new cameras.
+        if not force and len(pending_batch) < SCAN_BATCH_SIZE and now - last_batch_flush < 2.0:
+            return
+        batch = pending_batch[:]
+        on_batch(batch)
+        del pending_batch[:len(batch)]
+        last_batch_flush = time.monotonic()
+
     def add(cams: list[dict]) -> None:
         for cam in cams:
             cid = cam.get('id', '')
             if cid and cid not in seen_ids:
                 seen_ids.add(cid)
                 pending_batch.append(cam)
-                if collect: cameras.append(cam)
+                if collect:
+                    cameras.append(cam)
                 if on_batch and len(pending_batch) >= SCAN_BATCH_SIZE:
-                    batch=pending_batch[:]; pending_batch.clear(); on_batch(batch)
-    def flush_batch():
-        if on_batch and pending_batch:
-            batch=pending_batch[:]; pending_batch.clear(); on_batch(batch)
+                    flush_batch(force=True)
+
+    # Index supported files in one pruned filesystem walk. Repeated root.rglob()
+    # calls for each extension made large workspace scans unnecessarily slow.
+    source_files = {ext: [] for ext in ('.txt', '.m3u', '.m3u8', '.json', '.csv', '.xml')}
+    walked_dirs = 0
+    last_index_log = time.monotonic()
+    for current_dir, dirnames, filenames in os.walk(str(root), topdown=True, followlinks=False):
+        walked_dirs += 1
+        now = time.monotonic()
+        if now - last_index_log >= 5.0:
+            indexed_count = sum(len(paths) for paths in source_files.values())
+            log.info('[Scanner] Indexing still active: directories=%d supported_files=%d current_dir=%s',
+                     walked_dirs, indexed_count, current_dir)
+            last_index_log = now
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith('.') and d not in _SKIP_DIRS)
+        for filename in filenames:
+            path = Path(current_dir) / filename
+            ext = path.suffix.lower()
+            if ext in source_files and not _should_skip(path, root):
+                source_files[ext].append(path)
+    for paths in source_files.values():
+        paths.sort()
+    log.info('[Scanner] Indexed supported files once: %s',
+             ', '.join(f'{ext}={len(paths)}' for ext, paths in source_files.items()))
 
     def changed(path: Path) -> bool:
         try:
@@ -5025,11 +5067,12 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
         except (OSError, sqlite3.Error):
             pass
 
-    for txt in sorted(root.rglob('*.txt')):
+    for txt in source_files['.txt']:
         if _should_skip(txt, root):
             continue
         current_sources.add(str(txt))
         if not changed(txt):
+            flush_batch()
             continue
         name_low = txt.name.lower()
         parsed = []
@@ -5083,12 +5126,14 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
         except Exception as e:
             log.debug('Error reading %s: %s', txt, e)
             record(txt, 0, 'error')
+            flush_batch()
             continue
         add(parsed)
         source_members[str(txt)] = {c['id'] for c in parsed if c.get('id')}
         record(txt, len(parsed))
+        flush_batch()
 
-    for m3u in sorted(list(root.rglob('*.m3u')) + list(root.rglob('*.m3u8'))):
+    for m3u in sorted(source_files['.m3u'] + source_files['.m3u8']):
         if _should_skip(m3u, root):
             continue
         current_sources.add(str(m3u))
@@ -5097,8 +5142,9 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
             add(parsed)
             source_members[str(m3u)] = {c['id'] for c in parsed if c.get('id')}
             record(m3u, len(parsed))
+        flush_batch()
 
-    for jf in sorted(root.rglob('*.json')):
+    for jf in source_files['.json']:
         if _should_skip(jf, root) or jf.name in {'package.json', 'package-lock.json'}:
             continue
         current_sources.add(str(jf))
@@ -5109,12 +5155,14 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                     parsed = _parse_json_file(str(jf))
             except Exception:
                 record(jf, 0, 'error')
+                flush_batch()
                 continue
             add(parsed)
             source_members[str(jf)] = {c['id'] for c in parsed if c.get('id')}
             record(jf, len(parsed))
+        flush_batch()
 
-    for cf in sorted(root.rglob('*.csv')):
+    for cf in source_files['.csv']:
         if _should_skip(cf, root):
             continue
         current_sources.add(str(cf))
@@ -5123,8 +5171,9 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
             add(parsed)
             source_members[str(cf)] = {c['id'] for c in parsed if c.get('id')}
             record(cf, len(parsed))
+        flush_batch()
 
-    for xf in sorted(root.rglob('*.xml')):
+    for xf in source_files['.xml']:
         if _should_skip(xf, root):
             continue
         current_sources.add(str(xf))
@@ -5133,8 +5182,9 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
             add(parsed)
             source_members[str(xf)] = {c['id'] for c in parsed if c.get('id')}
             record(xf, len(parsed))
+        flush_batch()
 
-    flush_batch()
+    flush_batch(force=True)
     if pending_records:
         def _flush_records():
             c=_db_conn(); c.executemany("INSERT INTO discovery_sources(path,size_bytes,mtime_ns,last_scanned,scan_status,camera_count) VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,last_scanned=excluded.last_scanned,scan_status=excluded.scan_status,camera_count=excluded.camera_count",pending_records); c.commit()
@@ -5180,12 +5230,12 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                 if on_batch:
                     pending_batch.append(cam)
                     if len(pending_batch) >= SCAN_BATCH_SIZE:
-                        batch = pending_batch[:]
-                        pending_batch.clear()
-                        on_batch(batch)
+                        flush_batch(force=True)
+                    else:
+                        flush_batch()
                 if collect:
                     cameras.append(cam)
-    flush_batch()
+    flush_batch(force=True)
     _last_discovery_members = source_members
     log.info('Discovery: found %d cameras in %s%s', len(cameras), search_dir,
              ' (forced)' if force else '')
@@ -5567,21 +5617,22 @@ def start_validation_queue_worker(max_workers: int | None = None,
                     continue
                 slot_held = True
                 try:
-                    claimed = _claim_validation_batch(current_batch_limit, worker_id)
+                    # Keep batches short enough that freshly discovered/high-priority
+                    # cameras are not stuck behind hundreds of old queued records.
+                    fair_claim_limit = min(current_batch_limit, max(25, current_workers * 4))
+                    claimed = _claim_validation_batch(fair_claim_limit, worker_id)
                     if not claimed:
-                        _touch_worker('validation-queue', 'idle', 'queue empty')
-                        _validation_queue_restart_requested.wait(30.0)
+                        _touch_worker('validation-queue', 'idle', 'queue empty; polling for newly discovered cameras')
+                        _validation_queue_restart_requested.wait(3.0)
                         continue
                     ids = [cam['id'] for cam in claimed]
                     db_set_status_bulk(ids, 'checking')
                     if VALIDATION_BATCH_OVERRIDE:
-                        log.info('[Validator] Queue lease batch — %d/%d cameras claimed, workers=%d (fixed batch=%d)',
-                                 len(claimed), current_batch_limit, current_workers, current_batch_limit)
-                        if len(claimed) < current_batch_limit:
-                            log.info('[Validator] Partial batch is due to currently eligible/unlocked queue rows; worker count does not reduce the configured batch size.')
+                        log.info('[Validator] Queue lease batch — %d cameras claimed, workers=%d (configured ceiling=%d, responsive claim=%d)',
+                                 len(claimed), current_workers, current_batch_limit, fair_claim_limit)
                     else:
-                        log.info('[Validator] Queue lease batch — %d cameras, workers=%d (auto batch=%d)',
-                                 len(claimed), current_workers, current_batch_limit)
+                        log.info('[Validator] Queue lease batch — %d cameras, workers=%d (auto ceiling=%d, responsive claim=%d)',
+                                 len(claimed), current_workers, current_batch_limit, fair_claim_limit)
                     _record_recovery_event('validation_batch', worker_id, 'claimed', str(len(claimed)))
                     run_validation_cycle(claimed, max_workers=current_workers, scope='queue-resume', _lock_held=True)
                     _release_validation_claims(ids, worker_id)
@@ -8076,7 +8127,7 @@ async function lookupDeviceLocation() {
   const status = document.getElementById('device-intel-status');
   const out = document.getElementById('device-intel-result');
   if (!activeIntelCameraId) return;
-  status.textContent = 'Looking up approximate public-IP location…';
+  status.textContent = 'Looking up approximate public-IP location (multiple HTTPS providers)…';
   try {
     const r = await fetch('/api/cameras/' + encodeURIComponent(activeIntelCameraId) + '/geo-update', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'lookup'})});
     const d = await r.json();
@@ -8979,6 +9030,7 @@ def _scan_and_upsert(force: bool = False) -> list[dict]:
             'updated_at': utc_iso(),
         })
     totals={'discovered':0,'processed':0,'added':0,'updated':0,'skipped':0,'failed':0}
+    last_progress_log = [0.0]
     def batch_upsert(batch):
         if _SCAN_CANCEL.is_set(): return
         while _SCAN_PAUSE.is_set() and not _SCAN_CANCEL.is_set(): _scan_state_set(phase='paused',paused=True); time.sleep(.25)
@@ -8991,6 +9043,11 @@ def _scan_and_upsert(force: bool = False) -> list[dict]:
                 chunk=ids[pos:pos+400]; ph=','.join('?'*len(chunk)); before.update(r['id'] for r in c.execute(f'SELECT id FROM cameras WHERE id IN ({ph})',chunk).fetchall())
             db_bulk_upsert(batch); totals['processed']+=len(batch); totals['discovered']+=len(batch); totals['added']+=sum(1 for x in ids if x not in before); totals['updated']+=sum(1 for x in ids if x in before)
             _scan_state_set(discovered=totals['discovered'],processed=totals['processed'],added=totals['added'],updated=totals['updated'])
+            now = time.monotonic()
+            if last_progress_log[0] == 0.0 or now - last_progress_log[0] >= 5.0:
+                log.info('[Scanner] Live progress: discovered=%d processed=%d added=%d updated=%d failed=%d',
+                         totals['discovered'], totals['processed'], totals['added'], totals['updated'], totals['failed'])
+                last_progress_log[0] = now
         except Exception as exc:
             totals['failed']+=len(batch); _scan_state_set(failed=totals['failed'],last_error=str(exc)[:500]); raise
     try:
@@ -9001,6 +9058,10 @@ def _scan_and_upsert(force: bool = False) -> list[dict]:
             db_reconcile_source(source_file,found_ids)
         if not _SCAN_CANCEL.is_set(): db_prune_deleted(limit=1000,retention_days=DELETED_RETENTION_DAYS)
         finished=utc_iso(); _scan_state_set(running=False,phase='cancelled' if _SCAN_CANCEL.is_set() else 'complete',cancel_requested=_SCAN_CANCEL.is_set(),finished_at=finished,last_scan_at=finished,**totals)
+        log.info('[Scanner] %s: discovered=%d processed=%d added=%d updated=%d skipped=%d failed=%d',
+                 'Cancelled' if _SCAN_CANCEL.is_set() else 'Complete',
+                 totals['discovered'], totals['processed'], totals['added'],
+                 totals['updated'], totals['skipped'], totals['failed'])
         try: _db_retry_write(lambda: _db_conn().execute('INSERT INTO scan_history(started_at,finished_at,force_scan,discovered,processed,added,updated,skipped,failed,detail) VALUES(?,?,?,?,?,?,?,?,?,?)',(started,finished,int(force),totals['discovered'],totals['processed'],totals['added'],totals['updated'],totals['skipped'],totals['failed'],'cancelled' if _SCAN_CANCEL.is_set() else 'ok')).connection.commit(),'scan history')
         except Exception: pass
         return []
@@ -9516,42 +9577,94 @@ def _rtsp_describe_verified(host: str, port: int, path: str,
 
 
 def _device_geo(host: str, enabled: bool = False) -> dict:
-    """Optionally enrich one explicitly supplied public IP.
+    """Look up approximate location for a public device IP using HTTPS fallbacks.
 
-    Private/local addresses are intentionally never sent to a public service.
-    Results are approximate IP geolocation, not physical device GPS.
+    A reachable/live camera is not necessarily geolocatable: private RFC1918,
+    loopback, link-local and other non-global addresses do not encode physical
+    location. Never substitute the dashboard server's own public IP for the
+    camera's IP, because that would silently report the hosting provider's site.
     """
-    if not enabled or _requests is None:
-        return {}
-    try:
-        import ipaddress
-        addr = ipaddress.ip_address(host)
-        if addr.is_private or addr.is_loopback or addr.is_reserved:
-            return {'geo_source': 'private-network', 'geo_confidence': 'none'}
-    except ValueError:
-        return {'geo_source': 'hostname', 'geo_confidence': 'none'}
-    endpoint = os.getenv('CAMERA_GEO_API_URL',
-                         'https://ipapi.co/{ip}/json/').strip()
-    if '{ip}' not in endpoint or not endpoint.lower().startswith('https://'):
+    if not enabled:
         return {'geo_source': 'disabled', 'geo_confidence': 'none'}
+    if _requests is None:
+        return {'geo_source': 'dependency-missing', 'geo_confidence': 'none',
+                'detail': 'The requests package is unavailable; install project requirements.'}
+
+    import ipaddress
+    target = str(host or '').strip().strip('[]')
     try:
-        response = _requests.get(endpoint.format(ip=quote(host, safe='')),
-                                  timeout=6)
-        data = response.json() if response.ok else {}
-        if not isinstance(data, dict):
-            return {}
-        return {
-            'country': str(data.get('country_name') or data.get('country') or ''),
-            'region': str(data.get('region') or data.get('region_name') or ''),
-            'city': str(data.get('city') or ''),
-            'isp': str(data.get('org') or data.get('isp') or ''),
-            'asn': str(data.get('asn') or data.get('as') or ''),
-            'geo_source': 'ip-geolocation',
-            'geo_confidence': 'approximate',
-        }
-    except Exception as exc:
-        log.info('Device geolocation lookup unavailable: %s', type(exc).__name__)
-        return {'geo_source': 'lookup-failed', 'geo_confidence': 'none'}
+        addr = ipaddress.ip_address(target)
+    except ValueError:
+        # Hostnames are allowed only when they resolve to a globally routable IP.
+        try:
+            resolved = []
+            for item in socket.getaddrinfo(target, None, type=socket.SOCK_STREAM):
+                try:
+                    candidate = ipaddress.ip_address(item[4][0].split('%', 1)[0])
+                    if candidate.is_global and candidate not in resolved:
+                        resolved.append(candidate)
+                except ValueError:
+                    continue
+            addr = resolved[0] if resolved else None
+        except (OSError, TypeError):
+            addr = None
+        if addr is None:
+            return {'geo_source': 'not-publicly-geolocatable', 'geo_confidence': 'none',
+                    'detail': 'This device address is a private/local IP or did not resolve to a public IP. A live connection does not provide GPS coordinates. Enter the device site manually, or use a public IP assigned to the camera site.'}
+    if not addr.is_global:
+        return {'geo_source': 'private-network', 'geo_confidence': 'none',
+                'detail': 'This is not a globally routable public IP. Public-IP geolocation cannot determine the camera site from a private/local address; use the saved site location or enter it manually.'}
+
+    ip = str(addr)
+    # Provider schemas differ. Try several HTTPS services, stopping at the first
+    # valid result containing at least one usable geographic field.
+    providers = (
+        ('ipapi.co', f'https://ipapi.co/{quote(ip, safe="")}/json/'),
+        ('ipwho.is', f'https://ipwho.is/{quote(ip, safe="")}'),
+        ('ipinfo.io', f'https://ipinfo.io/{quote(ip, safe="")}/json'),
+    )
+    failures = []
+    for provider, url in providers:
+        try:
+            response = _requests.get(url, timeout=(2.5, 3.5),
+                                     headers={'User-Agent': 'CameraDashboard/177.0'})
+            if not response.ok:
+                failures.append(f'{provider}: HTTP {response.status_code}')
+                continue
+            data = response.json()
+            if not isinstance(data, dict):
+                failures.append(f'{provider}: invalid response')
+                continue
+            if data.get('error') or data.get('success') is False:
+                failures.append(f'{provider}: lookup rejected')
+                continue
+            connection = data.get('connection') if isinstance(data.get('connection'), dict) else {}
+            country = str(data.get('country_name') or data.get('country') or '').strip()
+            region = str(data.get('region') or data.get('region_name') or '').strip()
+            city = str(data.get('city') or '').strip()
+            isp = str(data.get('org') or data.get('isp') or connection.get('isp') or '').strip()
+            asn = str(data.get('asn') or connection.get('asn') or '').strip()
+            # ipinfo returns an ISO country code, not a country name.
+            if len(country) == 2 and country.isalpha():
+                try:
+                    import pycountry
+                    country_obj = pycountry.countries.get(alpha_2=country.upper())
+                    if country_obj:
+                        country = country_obj.name
+                except ImportError:
+                    country = country.upper()
+            if any((city, region, country)):
+                return {'country': country, 'region': region, 'city': city,
+                        'isp': isp, 'asn': asn, 'geo_source': provider,
+                        'geo_confidence': 'approximate', 'ip': ip,
+                        'detail': 'Approximate public-IP geolocation; not device GPS.'}
+            failures.append(f'{provider}: no geographic fields')
+        except Exception as exc:
+            failures.append(f'{provider}: {type(exc).__name__}')
+            log.debug('Geolocation provider %s failed: %s', provider, type(exc).__name__)
+
+    return {'geo_source': 'lookup-failed', 'geo_confidence': 'none', 'ip': ip,
+            'detail': 'No geolocation provider returned a usable city, region, or country. ' + '; '.join(failures)}
 
 
 def discover_local_device(host: str, port, username: str, password: str,
@@ -11941,8 +12054,10 @@ def api_camera_geo_update(cam_id: str) -> Response:
     if mode == 'lookup':
         geo = _device_geo(str(cam.get('ip') or ''), True)
         if not geo or not any(str(geo.get(k) or '').strip() for k in ('city','region','country')):
+            # Preserve any already saved site/location fields instead of implying
+            # that a live camera's private IP can be geolocated.
             return jsonify({'ok':True,'updated':False,'geo':geo,
-                'detail':'No usable city/region/country was returned. Private IPs cannot be located through public-IP geolocation; enter the location manually.'})
+                'detail':str((geo or {}).get('detail') or 'No geolocation provider returned a usable city, region, or country. Existing saved location was not changed.')})
         fields = {k:(str(geo.get(src) or '').strip() or str(cam.get(k) or '').strip()) for k,src in [('country','country'),('region','region'),('city','city')]}
         fields['geo_source']=str(geo.get('geo_source') or 'ip-geolocation')
         fields['geo_confidence']=str(geo.get('geo_confidence') or 'approximate')
@@ -15956,6 +16071,11 @@ def main() -> None:
 
         if _shutdown_requested.is_set():
             return
+        try:
+            start_validation_queue_worker(max_workers=None, delay=1.0)
+            log.info('[Startup] Validation queue worker started before discovery; new cameras can be checked during the scan')
+        except Exception:
+            log.exception('[Startup] Could not start early validation queue worker')
         log.info('Background startup: scanning %s …', _SEARCH_DIR)
         try:
             _scan_and_upsert()
@@ -15965,25 +16085,11 @@ def main() -> None:
             log.error('Startup scan error: %s', e, exc_info=True)
             cameras = []
 
-        try:
-            if _shutdown_requested.is_set(): return
-            startup_workers, resume_limit = _validation_worker_config()
-            resume_batch = db_get_resume_batch(resume_limit)
-            by_id = {cam['id']: cam for cam in resume_batch}
-            by_id.update({cam['id']: cam for cam in cameras})
-            validation_batch = list(by_id.values())
-            if validation_batch:
-                try:
-                    db_set_status_bulk([cam['id'] for cam in validation_batch], 'checking')
-                except sqlite3.OperationalError as exc:
-                    log.warning('Startup status marking deferred after SQLite contention: %s', exc)
-            log.info('Startup validation resume — %d queued cameras selected '
-                     '(limit=%d)', len(validation_batch), resume_limit)
-            start_background_validation(validation_batch, delay=2.0,
-                                         max_workers=startup_workers, scope='all')
-            start_validation_queue_worker(max_workers=None, delay=8.0)
-        except Exception as e:
-            log.error('Startup validation worker error: %s', e, exc_info=True)
+        if not _shutdown_requested.is_set():
+            # The persistent queue worker is the sole validation scheduler. Avoid
+            # claiming a second giant startup batch that would block newly found
+            # cameras behind a long one-shot validation cycle.
+            log.info('[Startup] Persistent validation queue remains the single validation runner for pending and newly discovered cameras')
 
         # Notifications must not be allowed to make database/startup recovery fail.
         try:
