@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v191.0 — FFmpeg Stream Diagnostics
+Camera Dashboard v193.0 — FFmpeg Startup Timeout Fix
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -196,7 +196,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '191.0'
+VERSION = '193.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -3879,13 +3879,27 @@ def _safe_str(v) -> str:
 
 
 def _mask_rtsp(rtsp_url: str) -> str:
-    """Hide RTSP passwords/userinfo safely for logs and diagnostics."""
+    """Mask credentials in either a raw RTSP URL or text containing RTSP URLs."""
     if not rtsp_url:
         return ''
+    value = str(rtsp_url)
+    # Stream logs pass formatted messages (not just a URL). The previous code
+    # returned those messages unchanged because their overall scheme is empty.
+    # Sanitize every embedded RTSP URL before handling a raw URL below.
+    if not value.lower().startswith(('rtsp://', 'rtsps://')):
+        pattern = re.compile(r'''(?i)rtsps?://[^\s'"<>]+''')
+        def _replace_embedded(match):
+            token = match.group(0)
+            trailing = ''
+            while token and token[-1] in '),;]':
+                trailing = token[-1] + trailing
+                token = token[:-1]
+            return _mask_rtsp(token) + trailing
+        return pattern.sub(_replace_embedded, value)
     try:
-        parsed=urlsplit(str(rtsp_url))
+        parsed=urlsplit(value)
         if parsed.scheme.lower() not in {'rtsp','rtsps'}:
-            return str(rtsp_url)
+            return value
         host=parsed.hostname or ''
         if ':' in host and not host.startswith('['): host=f'[{host}]'
         port=f':{parsed.port}' if parsed.port else ''
@@ -5296,35 +5310,48 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                     cam = _parse_valid_camera_block(block, str(txt))
                     if cam:
                         parsed.append(cam)
-            elif 'rtsp://' in content.lower():
-                parsed = _parse_rtsp_file(str(txt))
             else:
-                # Also accept plain inventory-style TXT files such as:
+                # A TXT file may contain BOTH RTSP links and inventory rows.
+                # Previously, the presence of one rtsp:// line sent the whole
+                # file through _parse_rtsp_file(), silently dropping rows such as
+                # "192.0.2.10,admin,password". Parse both formats and merge by ID.
+                if 'rtsp://' in content.lower() or 'rtsps://' in content.lower():
+                    parsed.extend(_parse_rtsp_file(str(txt)))
+
+                # Also accept plain inventory-style TXT rows in mixed files:
                 #   192.0.2.10,admin,password
                 #   192.0.2.11:8080 admin password hikvision
-                # This is deliberately conservative: only host-like tokens with
-                # credentials are treated as camera records.
+                # RTSP URLs and playlist directives are deliberately excluded.
                 for raw in content.splitlines():
                     line = raw.strip()
-                    if not line or line.startswith('#'):
+                    if not line or line.startswith('#') or line.lower().startswith(('rtsp://', 'rtsps://')):
                         continue
-                    parts = [p.strip() for p in re.split(r'[,;\t ]+', line) if p.strip()]
+                    parts = [p.strip() for p in re.split(r'[,;\\t ]+', line) if p.strip()]
                     if len(parts) < 3:
                         continue
                     target = parts[0]
-                    if not re.match(r'^(?:[A-Za-z0-9._-]+)(?::\d{1,5})?$', target):
+                    if not re.match(r'^(?:[A-Za-z0-9._-]+)(?::\\d{1,5})?$', target):
                         continue
                     host, port = (target.rsplit(':', 1) if
                                   ':' in target and target.rsplit(':', 1)[1].isdigit()
                                   else (target, '80'))
-                    # Skip obvious header rows.
                     if host.lower() in {'ip', 'host', 'address', 'ip_address', 'ip-address'}:
+                        continue
+                    # A bare word is more likely a group/title line than a host.
+                    # Accept a dotted host/IP, or an explicit host:port token.
+                    if '.' not in host and ':' not in target:
+                        continue
+                    # Avoid treating arbitrary labels as credentials; inventory
+                    # rows must have a plausible host and non-empty username.
+                    if not host or not parts[1] or parts[1].lower() in {'username', 'user'}:
                         continue
                     user, password = parts[1], parts[2]
                     vendor = parts[3] if len(parts) > 3 else 'auto'
                     try:
                         pnum = int(port)
                     except ValueError:
+                        continue
+                    if not (1 <= pnum <= 65535):
                         continue
                     cid = _cam_id(host, pnum, user)
                     parsed.append({
@@ -5336,6 +5363,23 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                         'username': user, 'password': password,
                         'group_name': 'TXT Import',
                     })
+                # Keep the first record per ID, merging distinct stream URLs so
+                # a mixed file cannot create duplicate camera IDs in one batch.
+                merged_by_id = {}
+                for cam in parsed:
+                    cid = str(cam.get('id') or '')
+                    if not cid:
+                        continue
+                    if cid not in merged_by_id:
+                        merged_by_id[cid] = cam
+                    else:
+                        existing = merged_by_id[cid]
+                        urls = list(existing.get('rtsp_urls') or [])
+                        for url in cam.get('rtsp_urls') or []:
+                            if url not in urls:
+                                urls.append(url)
+                        existing['rtsp_urls'] = urls
+                parsed = list(merged_by_id.values())
         except Exception as e:
             log.debug('Error reading %s: %s', txt, e)
             record(txt, 0, 'error')
@@ -5343,6 +5387,10 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
             continue
         add(parsed)
         source_members[str(txt)] = {c['id'] for c in parsed if c.get('id')}
+        if parsed:
+            log.info('[Scanner] TXT parsed source=%s records=%d unique_ids=%d rtsp_urls=%d',
+                     txt.name, len(parsed), len(source_members[str(txt)]),
+                     sum(len(c.get('rtsp_urls') or []) for c in parsed))
         record(txt, len(parsed))
         flush_batch()
 
@@ -7348,7 +7396,7 @@ function updateLiveFeedCounter() {
 
 function toggleWatch(id, card) {
   if (liveStreams[id]) { stopCam(id); return; }
-  liveStreams[id] = { ws:null, canvas:null, tid:null };
+  liveStreams[id] = { ws:null, canvas:null, tid:null, connecting:true };
   updateLiveFeedCounter();
   fetchRtsp(id).then(() => tryStream(id)).catch(e => {
     delete liveStreams[id];
@@ -7405,14 +7453,18 @@ function tryStream(id) {
   if (watchBtn) { watchBtn.textContent = '■ Stop'; watchBtn.classList.remove('btn-green'); }
 
   // The server's /stream endpoint runs FFmpeg and returns multipart MJPEG.
-  // A timestamp avoids stale browser/proxy caches.
+  // A timestamp avoids stale browser/proxy caches. The startup timeout above is intentionally longer than one RTSP retry.
   let connected = false;
+  // The server tries multiple RTSP URLs and both TCP/UDP transports.
+  // A 20-second browser deadline can cancel the HTTP request before those
+  // retries finish (each no-frame probe may wait up to 12 seconds).
+  // Allow a bounded 60 seconds for the first decodable JPEG frame.
   st.tid = setTimeout(() => {
     if (liveStreams[id] === st && !connected) {
-      showToast('❌ FFmpeg stream did not start in time', true);
+      showToast('❌ No video frame after 60s. Check stream_errors.log for RTSP/network/codec details.', true);
       stopCam(id);
     }
-  }, 20000);
+  }, 60000);
 
   img.onload = () => {
     if (liveStreams[id] !== st) return;
