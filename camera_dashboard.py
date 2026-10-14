@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v185.0 — Camera Title & Metadata Sync Fix
+Camera Dashboard v188.0 — Validation Queue RTSP Decode Fix
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -195,7 +195,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '186.0'
+VERSION = '188.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -4045,7 +4045,12 @@ def _claim_validation_batch(limit: int, worker_id: str) -> list[dict]:
         return rows
 
     rows = _db_retry_write(_write, 'claim validation batch')
-    return rows
+    # Validation expects rtsp_urls to be a list, not the JSON text stored in
+    # SQLite. _db_row performs that conversion and keeps the rest of the row
+    # as a normal dict. Returning dict(row) here leaves rtsp_urls as a string;
+    # _validate_one then iterates individual characters, produces no ranked
+    # candidates, and incorrectly labels every camera "no-decoded-video".
+    return [_db_row(row) for row in rows]
 
 
 def _release_validation_claims(cam_ids: list[str], worker_id: str = '') -> None:
@@ -5713,7 +5718,7 @@ def _run_validation_cycle_impl(cameras: list[dict], max_workers: int | None = No
     total = len(cameras)
     with _val_lock:
         _val_progress.update({
-            'total': total, 'done': 0, 'online': 0, 'offline': 0,
+            'total': total, 'done': 0, 'online': 0, 'offline': 0, 'errors': 0,
             'running': True, 'started': time.time(), 'elapsed': 0.0, 'scope': scope,
             'speed_per_sec': 0.0, 'eta_seconds': None,
         })
@@ -5724,13 +5729,17 @@ def _run_validation_cycle_impl(cameras: list[dict], max_workers: int | None = No
                              thread_name_prefix='cam-val') as pool:
         futures = {pool.submit(_validate_one_and_close, cam): cam for cam in cameras}
         for fut in as_completed(futures):
-            status = 'offline'
+            status = 'error'
             try:
                 status = fut.result()
             except Exception as e:
-                log.debug('[Validator] Error: %s', e)
+                cam = futures.get(fut, {})
+                cam_id = cam.get('id', '?') if hasattr(cam, 'get') else '?'
+                log.warning('[Validator] Camera validation raised an exception (camera_id=%s): %s', cam_id, e, exc_info=True)
             with _val_lock:
                 _val_progress['done']    += 1
+                if status == 'error':
+                    _val_progress['errors'] = int(_val_progress.get('errors', 0) or 0) + 1
                 _val_progress['elapsed']  = round(time.monotonic() - t0, 1)
                 elapsed_now = max(0.001, time.monotonic() - t0)
                 _val_progress['speed_per_sec'] = round(_val_progress['done'] / elapsed_now, 2)
@@ -5738,7 +5747,7 @@ def _run_validation_cycle_impl(cameras: list[dict], max_workers: int | None = No
                 _val_progress['eta_seconds'] = round(remaining / _val_progress['speed_per_sec'], 1) if _val_progress['speed_per_sec'] > 0 else None
                 if status == 'online':
                     _val_progress['online'] += 1
-                else:
+                elif status == 'offline':
                     _val_progress['offline'] += 1
     elapsed = time.monotonic() - t0
     with _val_lock:
@@ -5754,8 +5763,10 @@ def _run_validation_cycle_impl(cameras: list[dict], max_workers: int | None = No
         cycle_online = int(_val_progress.get('online', 0) or 0)
         cycle_offline = int(_val_progress.get('offline', 0) or 0)
         cycle_done = int(_val_progress.get('done', 0) or 0)
-    log.info('[Validator] Done in %.1fs — batch_done=%d/%d online=%d offline=%d',
-             elapsed, cycle_done, total, cycle_online, cycle_offline)
+    with _val_lock:
+        cycle_errors = int(_val_progress.get('errors', 0) or 0)
+    log.info('[Validator] Done in %.1fs — batch_done=%d/%d online=%d offline=%d errors=%d',
+             elapsed, cycle_done, total, cycle_online, cycle_offline, cycle_errors)
 
 
 def start_background_validation(cameras: list[dict], delay: float = 2.0,
@@ -16333,7 +16344,10 @@ def main() -> None:
             cameras = []
             log.info('Startup scan complete — streamed discovery batches into database')
         except Exception as e:
-            log.error('Startup scan error: %s', e, exc_info=True)
+            if _shutdown_requested.is_set() and 'cancelled during shutdown' in str(e).lower():
+                log.info('[Startup] Scan stopped cleanly because shutdown was requested')
+            else:
+                log.error('Startup scan error: %s', e, exc_info=True)
             cameras = []
 
         if not _shutdown_requested.is_set():
