@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v188.0 — Validation Queue RTSP Decode Fix
+Camera Dashboard v191.0 — FFmpeg Stream Diagnostics
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import socket
+import select
 import sqlite3
 import subprocess
 import sys
@@ -195,7 +196,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '188.0'
+VERSION = '191.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -5557,58 +5558,108 @@ def _classify_ffprobe_error(stderr: str, transport: str) -> str:
     return f'{transport}:{category}' + (f' ({detail})' if detail else '')
 
 
+def _ffmpeg_fallback_meta(rtsp_url: str, timeout: float = 8.0,
+                          transport: str = 'tcp',
+                          failure_reasons: Optional[list[str]] = None) -> Optional[dict]:
+    """Use the legacy FFmpeg frame-probe path when ffprobe cannot verify a stream.
+
+    Older dashboard builds used ffmpeg directly. Some hosted environments have
+    ffmpeg but no usable ffprobe binary/build, so keep that working path as a
+    compatibility fallback instead of marking every stream offline.
+    """
+    cmd = ['ffmpeg', '-hide_banner', '-nostdin', '-loglevel', 'info',
+           '-rtsp_transport', transport, '-timeout', '8000000',
+           '-i', rtsp_url, '-t', '2', '-frames:v', '1', '-f', 'null', '-']
+    try:
+        with _VALIDATION_PROBE_SEMAPHORE:
+            r = subprocess.run(cmd, capture_output=True, timeout=max(2.0, timeout))
+        output = (r.stderr or b'').decode(errors='ignore')
+        if r.returncode != 0:
+            if failure_reasons is not None:
+                failure_reasons.append(_classify_ffprobe_error(output, transport)
+                                       .replace('ffprobe', 'ffmpeg'))
+            return None
+        # A successful one-frame decode is enough to call the stream online.
+        codec, resolution, fps = '', '', 0.0
+        m = re.search(r'Video:\s*([^,\s]+).*?(\d{2,5}x\d{2,5})', output, re.I)
+        if m:
+            codec, resolution = m.group(1).upper(), m.group(2)
+        fm = re.search(r'(\d+(?:\.\d+)?)\s*fps', output, re.I)
+        if fm:
+            try:
+                fps = float(fm.group(1))
+            except ValueError:
+                fps = 0.0
+        return {'codec': codec, 'resolution': resolution, 'fps': fps}
+    except subprocess.TimeoutExpired:
+        if failure_reasons is not None:
+            failure_reasons.append(f'{transport}:ffmpeg-timeout')
+        return None
+    except FileNotFoundError:
+        if failure_reasons is not None:
+            failure_reasons.append(f'{transport}:ffmpeg-not-installed')
+        return None
+    except Exception as exc:
+        if failure_reasons is not None:
+            failure_reasons.append(f'{transport}:ffmpeg-probe-error ({type(exc).__name__})')
+        return None
+
+
 def _ffprobe_meta(rtsp_url: str, timeout: float = 12.0,
                   transport: str = 'tcp',
                   failure_reasons: Optional[list[str]] = None) -> Optional[dict]:
+    """Probe video metadata with ffprobe, falling back to the legacy ffmpeg path."""
     cmd = ['ffprobe', '-v', 'error', '-rtsp_transport', transport,
-           '-timeout', '8000000',  # 8 seconds in microseconds for FFmpeg RTSP timeout builds.
-           '-print_format', 'json',
-           '-show_streams', rtsp_url]
+           '-timeout', '8000000',
+           '-print_format', 'json', '-show_streams', rtsp_url]
+    ffprobe_reason = ''
     try:
         with _VALIDATION_PROBE_SEMAPHORE:
             r = subprocess.run(cmd, capture_output=True, timeout=timeout)
-        if r.returncode != 0:
-            if failure_reasons is not None:
-                failure_reasons.append(_classify_ffprobe_error(
-                    r.stderr.decode(errors='ignore'), transport))
-            return None
-        data  = json.loads(r.stdout.decode(errors='ignore'))
-        video = next((s for s in data.get('streams', [])
-                      if s.get('codec_type') == 'video'), None)
-        if not video:
-            if failure_reasons is not None:
-                failure_reasons.append(f'{transport}:no-video-stream')
-            return None
-        w, h = video.get('width', 0), video.get('height', 0)
-        fps  = 0.0
-        for key in ('avg_frame_rate', 'r_frame_rate'):
-            afr = video.get(key, '')
-            if '/' in afr:
-                try:
-                    n, d = afr.split('/')
-                    if float(d):
-                        fps = round(float(n) / float(d), 1)
-                        if fps > 0:
-                            break
-                except Exception:
-                    pass
-        return {
-            'codec':      video.get('codec_name', '').upper(),
-            'resolution': f'{w}x{h}' if w and h else '',
-            'fps':        fps,
-        }
+        if r.returncode == 0:
+            data = json.loads(r.stdout.decode(errors='ignore'))
+            video = next((s for s in data.get('streams', [])
+                          if s.get('codec_type') == 'video'), None)
+            if video:
+                w, h = video.get('width', 0), video.get('height', 0)
+                fps = 0.0
+                for key in ('avg_frame_rate', 'r_frame_rate'):
+                    afr = video.get(key, '')
+                    if '/' in afr:
+                        try:
+                            n, d = afr.split('/')
+                            if float(d):
+                                fps = round(float(n) / float(d), 1)
+                                if fps > 0:
+                                    break
+                        except Exception:
+                            pass
+                return {'codec': video.get('codec_name', '').upper(),
+                        'resolution': f'{w}x{h}' if w and h else '',
+                        'fps': fps}
+            ffprobe_reason = f'{transport}:no-video-stream'
+        else:
+            ffprobe_reason = _classify_ffprobe_error(
+                r.stderr.decode(errors='ignore'), transport)
     except subprocess.TimeoutExpired:
-        if failure_reasons is not None:
-            failure_reasons.append(f'{transport}:timeout')
-        return None
+        ffprobe_reason = f'{transport}:ffprobe-timeout'
+    except FileNotFoundError:
+        ffprobe_reason = f'{transport}:ffprobe-not-installed'
     except (ValueError, json.JSONDecodeError):
-        if failure_reasons is not None:
-            failure_reasons.append(f'{transport}:invalid-ffprobe-output')
-        return None
-    except Exception:
-        if failure_reasons is not None:
-            failure_reasons.append(f'{transport}:probe-error')
-        return None
+        ffprobe_reason = f'{transport}:invalid-ffprobe-output'
+    except Exception as exc:
+        ffprobe_reason = f'{transport}:ffprobe-probe-error ({type(exc).__name__})'
+
+    # Compatibility: the previous working version verified a decoded frame
+    # with ffmpeg directly. Try that path before concluding the camera is offline.
+    fallback = _ffmpeg_fallback_meta(rtsp_url, timeout=min(timeout, 8.0),
+                                      transport=transport,
+                                      failure_reasons=failure_reasons)
+    if fallback:
+        return fallback
+    if failure_reasons is not None and ffprobe_reason:
+        failure_reasons.append(ffprobe_reason)
+    return None
 
 
 def _score_rtsp_candidate(cam: dict, rtsp_url: str, position: int) -> float:
@@ -5671,12 +5722,17 @@ def _validate_one(cam: dict) -> str:
                                       latency_ms=ms, candidate_url=rtsp_url,
                                       transport=transport, candidate_score=score)
                 db_promote_rtsp_url(cam_id, rtsp_url)
+                _stream_log('[Validation] ONLINE camera=%s transport=%s latency_ms=%s codec=%s resolution=%s fps=%s url=%s',
+                            cam_id, transport, ms, meta.get('codec', ''),
+                            meta.get('resolution', ''), meta.get('fps', 0), rtsp_url)
                 return 'online'
             reasons.extend(f'candidate:{score}:{reason}'
                            for reason in probe_reasons)
     reason = '; '.join(reasons)[-240:] or 'no-decoded-video'
     db_update_validation(cam_id, 'offline', failure_reason=reason,
                          candidate_url=last_url, transport=last_transport)
+    _stream_log('[Validation] OFFLINE camera=%s candidates=%s reason=%s last_transport=%s url=%s',
+                cam_id, len(ranked), reason, last_transport or 'none', last_url or 'none')
     return 'offline'
 
 
@@ -6259,26 +6315,46 @@ def _ffmpeg_snap_cmd(rtsp_url: str, transport: str = 'tcp') -> list[str]:
     ]
 
 
-def _stream_jpeg_frames(proc: subprocess.Popen):
-    """Generator yielding raw JPEG bytes from an ffmpeg MJPEG stream."""
+def _stream_jpeg_frames(proc: subprocess.Popen, first_frame_timeout: float = 12.0,
+                        idle_timeout: float = 20.0):
+    """Yield JPEG frames and fail explicitly when FFmpeg produces no video."""
     buf = b''
-    try:
-        while True:
-            chunk = proc.stdout.read(8192)
-            if not chunk:
+    started = time.monotonic()
+    last_data = started
+    got_frame = False
+    if not proc.stdout:
+        raise RuntimeError('FFmpeg stdout pipe unavailable')
+    fd = proc.stdout.fileno()
+    while True:
+        deadline = (started + max(1.0, first_frame_timeout) if not got_frame
+                    else last_data + max(1.0, idle_timeout))
+        wait = max(0.0, deadline - time.monotonic())
+        readable, _, _ = select.select([fd], [], [], min(wait, 1.0))
+        if not readable:
+            if time.monotonic() >= deadline:
+                if not got_frame:
+                    raise TimeoutError(f'no-video-frame-within-{first_frame_timeout:.0f}s')
+                raise TimeoutError(f'video-frame-stalled-for-{idle_timeout:.0f}s')
+            if proc.poll() is not None:
                 break
-            buf += chunk
-            if len(buf)>STREAM_MAX_BUFFER:
-                soi=buf.rfind(b'\xff\xd8'); buf=buf[soi:] if soi>=0 else buf[-65536:]
-            while True:
-                s = buf.find(b'\xff\xd8')
-                e = buf.find(b'\xff\xd9', s + 2) if s != -1 else -1
-                if s == -1 or e == -1:
-                    break
-                yield buf[s:e+2]
-                buf = buf[e+2:]
-    except GeneratorExit:
-        pass
+            continue
+        chunk = os.read(fd, 8192)
+        if not chunk:
+            break
+        last_data = time.monotonic()
+        buf += chunk
+        if len(buf) > STREAM_MAX_BUFFER:
+            soi = buf.rfind(b'\xff\xd8')
+            buf = buf[soi:] if soi >= 0 else buf[-65536:]
+        while True:
+            frame_start = buf.find(b'\xff\xd8')
+            frame_end = buf.find(b'\xff\xd9', frame_start + 2) if frame_start != -1 else -1
+            if frame_start == -1 or frame_end == -1:
+                break
+            frame = buf[frame_start:frame_end + 2]
+            buf = buf[frame_end + 2:]
+            got_frame = True
+            yield frame
 
 
 def _ffmpeg_diagnostic(proc: Optional[subprocess.Popen],
@@ -7261,7 +7337,7 @@ async function doLoadMore(btn) {
   }
 }
 
-// ── WebSocket MJPEG streaming ──────────────────────────────────────────────
+// ── FFmpeg HTTP MJPEG streaming ───────────────────────────────────────────
 function updateLiveFeedCounter() {
   const el=document.getElementById('statFeeds');
   const n=Object.keys(liveStreams).length + (typeof multiViewStreams !== 'undefined' ? Object.keys(multiViewStreams).length : 0);
@@ -7285,23 +7361,28 @@ function tryStream(id) {
   const st = liveStreams[id]; if (!st) return;
   const thumb = document.getElementById('thumb-' + id); if (!thumb) return;
 
-  let canvas = thumb.querySelector('canvas.live');
-  if (!canvas) {
-    canvas = document.createElement('canvas');
-    canvas.className = 'live'; canvas.style.display = 'none';
-    thumb.appendChild(canvas);
+  let img = thumb.querySelector('img.live-ffmpeg');
+  if (!img) {
+    img = document.createElement('img');
+    img.className = 'live live-ffmpeg';
+    img.alt = 'Live camera stream';
+    img.style.cssText = 'display:none;width:100%;height:100%;object-fit:contain';
+    thumb.appendChild(img);
   }
-  st.canvas = canvas;
-  const ctx = canvas.getContext('2d');
+  st.img = img;
 
   let badge = thumb.querySelector('.live-badge');
   if (!badge) {
-    badge = document.createElement('span'); badge.className = 'live-badge';
-    badge.textContent = '● LIVE'; badge.style.display = 'none'; thumb.appendChild(badge);
+    badge = document.createElement('span');
+    badge.className = 'live-badge';
+    badge.textContent = '● LIVE';
+    badge.style.display = 'none';
+    thumb.appendChild(badge);
   }
   let stopBtn = thumb.querySelector('.stop-btn');
   if (!stopBtn) {
-    stopBtn = document.createElement('button'); stopBtn.className = 'stop-btn';
+    stopBtn = document.createElement('button');
+    stopBtn.className = 'stop-btn';
     stopBtn.textContent = '■ Stop';
     stopBtn.onclick = e => { e.stopPropagation(); stopCam(id); };
     thumb.appendChild(stopBtn);
@@ -7311,50 +7392,45 @@ function tryStream(id) {
   const so = thumb.querySelector('.snap-overlay');
   if (sn) sn.style.opacity = '0.25';
   if (so) so.style.display = 'none';
-   if (ph) { const t = ph.querySelector('.ph-label'); if(t) t.textContent = 'Connecting…'; }
-  canvas.style.display = 'none'; badge.style.display = 'none'; stopBtn.style.display = 'block';
+  if (ph) {
+    ph.style.display = '';
+    const t = ph.querySelector('.ph-label') || ph.querySelector('span:last-child');
+    if (t) t.textContent = 'Connecting with FFmpeg…';
+  }
+  img.style.display = 'none';
+  badge.style.display = 'none';
+  stopBtn.style.display = 'block';
+
   const watchBtn = document.querySelector(`.cam-card[data-id="${id}"] .watch-btn`);
   if (watchBtn) { watchBtn.textContent = '■ Stop'; watchBtn.classList.remove('btn-green'); }
 
-  if (st.ws) { try { st.ws.close(); } catch(_) {} }
-  clearTimeout(st.tid);
+  // The server's /stream endpoint runs FFmpeg and returns multipart MJPEG.
+  // A timestamp avoids stale browser/proxy caches.
+  let connected = false;
+  st.tid = setTimeout(() => {
+    if (liveStreams[id] === st && !connected) {
+      showToast('❌ FFmpeg stream did not start in time', true);
+      stopCam(id);
+    }
+  }, 20000);
 
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-   const ws = new WebSocket(proto + '://' + location.host + '/ws/stream/' + encodeURIComponent(id));
-  ws.binaryType = 'arraybuffer';
-  st.ws = ws;
-  st.tid = setTimeout(() => { if (liveStreams[id]?.ws === ws) { ws.close(); onStreamFail(id); } }, 12000);
-
-  ws.onmessage = async ev => {
-    if (liveStreams[id]?.ws !== ws) return;
-     if (typeof ev.data === 'string') {
-       showToast('❌ ' + ev.data.replace(/^ERROR:\s*/i, ''), true);
-       stopCam(id);
-       return;
-     }
+  img.onload = () => {
+    if (liveStreams[id] !== st) return;
+    connected = true;
     clearTimeout(st.tid);
-    st.tid = setTimeout(() => { if (liveStreams[id]?.ws === ws) ws.close(); }, 8000);
-    try {
-      const bm = await createImageBitmap(new Blob([ev.data], {type:'image/jpeg'}));
-      if (!liveStreams[id]) { bm.close(); return; }
-      if (canvas.width !== bm.width || canvas.height !== bm.height) {
-        canvas.width = bm.width; canvas.height = bm.height;
-      }
-      ctx.drawImage(bm, 0, 0); bm.close();
-      if (canvas.style.display === 'none') {
-        if (ph) ph.style.display = 'none';
-        if (sn) sn.style.display = 'none';
-        canvas.style.display = 'block'; badge.style.display = 'block';
-      }
-    } catch(_) {}
+    if (ph) ph.style.display = 'none';
+    if (sn) sn.style.display = 'none';
+    img.style.display = 'block';
+    badge.style.display = 'block';
+    updateLiveFeedCounter();
   };
-  ws.onerror = () => { if (liveStreams[id]?.ws === ws) onStreamFail(id); };
-  ws.onclose = () => {
-    if (liveStreams[id]?.ws !== ws) return;
+  img.onerror = () => {
+    if (liveStreams[id] !== st) return;
     clearTimeout(st.tid);
-    if (canvas.style.display !== 'none') { showToast('Stream ended'); stopCam(id); }
-    else onStreamFail(id);
+    showToast('❌ FFmpeg HTTP stream failed; check stream_errors.log', true);
+    stopCam(id);
   };
+  img.src = '/stream/' + encodeURIComponent(id) + '?t=' + Date.now();
 }
 
 function onStreamFail(id) {
@@ -7365,11 +7441,12 @@ function onStreamFail(id) {
 
 function stopCam(id) {
   const st = liveStreams[id];
-  if (st) { clearTimeout(st.tid); if (st.ws) { try { st.ws.close(); } catch(_) {} } }
+  if (st) { clearTimeout(st.tid); if (st.ws) { try { st.ws.close(); } catch(_) {} } if (st.img) { st.img.onload=null; st.img.onerror=null; st.img.src=''; } }
   delete liveStreams[id];
   updateLiveFeedCounter();
   const thumb = document.getElementById('thumb-' + id); if (!thumb) return;
   thumb.querySelector('canvas.live')?.remove();
+  thumb.querySelector('img.live-ffmpeg')?.remove();
   const badge  = thumb.querySelector('.live-badge');
   const stopBtn= thumb.querySelector('.stop-btn');
   const ph = thumb.querySelector('.placeholder');
@@ -13290,25 +13367,36 @@ def stream_mjpeg(cam_id: str) -> Response:
                         stderr_lines = _capture_ffmpeg_stderr(proc)
                         _register_stream_proc(cam_id,proc)
                         candidate_frames = 0
-                        for frame in _stream_jpeg_frames(proc):
+                        for frame in _stream_jpeg_frames(proc, first_frame_timeout=12.0,
+                                                         idle_timeout=20.0):
                             candidate_frames += 1
                             sent_frames += 1
+                            if candidate_frames == 1:
+                                _stream_log('[HTTP stream] FIRST_FRAME camera=%s transport=%s frame_bytes=%s url=%s',
+                                            cam_id, transport, len(frame), rtsp_url)
                             yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
                         if candidate_frames:
+                            _stream_log('[HTTP stream] ENDED camera=%s transport=%s frames=%s url=%s',
+                                        cam_id, transport, candidate_frames, rtsp_url)
                             db_promote_rtsp_url(cam_id, rtsp_url)
                             return
-                        diagnostics.append(
-                            f'{transport} {_ffmpeg_diagnostic(proc, stderr_lines)}')
+                        detail = _ffmpeg_diagnostic(proc, stderr_lines)
+                        diagnostics.append(f'{transport} {detail}')
+                        _stream_log('[HTTP stream] NO_FRAMES camera=%s transport=%s detail=%s url=%s',
+                                    cam_id, transport, detail, rtsp_url)
                     except GeneratorExit:
                         raise
                     except Exception as exc:
-                        diagnostics.append(f'{transport} {type(exc).__name__}: {exc}')
+                        detail = f'{type(exc).__name__}: {exc}'
+                        diagnostics.append(f'{transport} {detail}')
+                        _stream_log('[HTTP stream] ATTEMPT_FAILED camera=%s transport=%s detail=%s url=%s',
+                                    cam_id, transport, detail, rtsp_url)
                     finally:
                         _stop_ffmpeg(proc)
                         _unregister_stream_proc(cam_id,proc)
             if not sent_frames:
-                _stream_log('HTTP stream failed camera=%s frames=0 detail=%s',
-                            cam_id, '; '.join(diagnostics)[-1000:])
+                _stream_log('[HTTP stream] FINAL_FAILURE camera=%s attempts=%s urls=%s frames=0 detail=%s',
+                            cam_id, attempt_count, len(urls), '; '.join(diagnostics)[-1000:])
         except GeneratorExit:
             pass
         finally:
