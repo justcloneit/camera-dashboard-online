@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v179.0 — Single-File RTSP Camera Dashboard
+Camera Dashboard v185.0 — Camera Title & Metadata Sync Fix
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -32,7 +32,11 @@ import time
 import webbrowser
 import signal
 import gzip
-import fcntl
+# Cross-platform advisory process locking: POSIX flock, Windows msvcrt byte lock.
+if os.name == 'nt':
+    import msvcrt
+else:
+    import fcntl
 import tempfile
 import uuid
 import zipfile
@@ -191,12 +195,26 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '179.0'
+VERSION = '186.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
 # Set CAMERA_DATA_DIR only when a different location is intentionally desired.
-DATA_DIR     = os.path.abspath(os.getenv('CAMERA_DATA_DIR', SCRIPT_DIR))
+def _default_data_dir() -> str:
+    configured = os.getenv('CAMERA_DATA_DIR', '').strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    if os.name == 'nt':
+        base = os.getenv('LOCALAPPDATA') or os.path.expanduser('~')
+        return os.path.join(base, 'CameraDashboard', 'data')
+    base = os.getenv('XDG_STATE_HOME', '').strip() or os.path.join(os.path.expanduser('~'), '.local', 'state')
+    # Hosted workspaces often have a persistent mounted workspace and rely on
+    # legacy DB adoption. Their explicit data dir remains supported.
+    if any(os.getenv(k) for k in ('REPL_ID','REPLIT_DEPLOYMENT','RAILWAY_PROJECT_ID','RAILWAY_ENVIRONMENT')):
+        return SCRIPT_DIR
+    return os.path.join(base, 'camera-dashboard')
+
+DATA_DIR     = _default_data_dir()
 # Keep runtime files (DB, snapshots, backups, Telegram config) private by default.
 try:
     os.umask(0o077)
@@ -220,7 +238,11 @@ def _release_pid_lock() -> None:
     if handle is None:
         return
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        if os.name == 'nt':
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     except Exception:
         pass
     try:
@@ -232,10 +254,18 @@ def _acquire_pid_lock() -> None:
     """Refuse startup if another dashboard process already owns this DB."""
     global _PID_LOCK_PATH, _pid_lock_handle
     _PID_LOCK_PATH = DB_PATH + '.pid'
-    handle = open(_PID_LOCK_PATH, 'a+', encoding='utf-8')
+    # Use a binary handle on Windows because msvcrt.locking locks byte ranges.
+    handle = open(_PID_LOCK_PATH, 'a+b' if os.name == 'nt' else 'a+', encoding=None if os.name == 'nt' else 'utf-8')
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        if os.name == 'nt':
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b' '); handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
         try:
             handle.seek(0)
             other = handle.read().strip() or 'unknown'
@@ -257,10 +287,22 @@ def _acquire_pid_lock() -> None:
             pass
         raise
 
-    handle.seek(0)
-    handle.truncate()
-    handle.write(str(os.getpid()))
-    handle.flush()
+    # The OS advisory lock is authoritative; PID text is only diagnostic.
+    # A hosted workspace may have a per-project quota exhausted while `df -h`
+    # still shows free filesystem blocks. Do not abort startup merely because
+    # this optional metadata write fails after the lock was successfully taken.
+    try:
+        handle.seek(0)
+        handle.truncate()
+        payload = str(os.getpid()).encode('ascii') if os.name == 'nt' else str(os.getpid())
+        handle.write(payload)
+        handle.flush()
+    except OSError as exc:
+        try:
+            print(f'[DB Lock] Advisory lock acquired; PID metadata could not be written: {exc}',
+                  file=sys.stderr, flush=True)
+        except Exception:
+            pass
     _pid_lock_handle = handle
     atexit.register(_release_pid_lock)
     log.info('[DB Lock] Acquired exclusive PID lock: %s (PID %d)',
@@ -503,23 +545,87 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # LOGGING
 # ══════════════════════════════════════════════════════════════════════════════
 
+class QuotaSafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Disable file logging after a filesystem/quota error without breaking the app.
+
+    Python's default logging error handler prints a large traceback for every log
+    event when rotation fails with EDQUOT/ENOSPC. On hosted platforms this can
+    flood the console while the actual application remains healthy. Keep console
+    logging active, emit one concise warning, and stop retrying the failing file.
+    """
+    def __init__(self, *args, **kwargs):
+        self._file_logging_disabled = False
+        self._quota_warning_emitted = False
+        super().__init__(*args, **kwargs)
+
+    def emit(self, record):
+        if self._file_logging_disabled:
+            return
+        try:
+            super().emit(record)
+        except OSError as exc:
+            self._disable_file_logging(exc)
+
+    def handleError(self, record):
+        exc_info = sys.exc_info()
+        exc = exc_info[1] if exc_info else None
+        if isinstance(exc, OSError):
+            self._disable_file_logging(exc)
+            return
+        # Do not allow a logging backend problem to cascade into app requests.
+        self._disable_file_logging(exc or RuntimeError('unknown logging handler error'))
+
+    def _disable_file_logging(self, exc):
+        self._file_logging_disabled = True
+        try:
+            if self.stream:
+                self.stream.close()
+        except Exception:
+            pass
+        self.stream = None
+        if not self._quota_warning_emitted:
+            self._quota_warning_emitted = True
+            try:
+                print(f'[Logging] File logging disabled for {self.baseFilename}: '
+                      f'{type(exc).__name__}: {exc}. Console logging remains active.',
+                      file=sys.stderr, flush=True)
+            except Exception:
+                pass
+
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)-8s %(name)s %(message)s',
     datefmt='%H:%M:%S',
     handlers=[
         logging.StreamHandler(),
-        logging.handlers.RotatingFileHandler(
+        QuotaSafeRotatingFileHandler(
             os.path.join(LOG_DIR, 'dashboard.log'),
             maxBytes=5_000_000, backupCount=3, encoding='utf-8'),
     ],
 )
 log = logging.getLogger('camera_dashboard')
+
+_LIFECYCLE_PATH = os.path.join(LOG_DIR, 'lifecycle.jsonl')
+def _lifecycle_event(event: str, reason: str = '') -> None:
+    """Append a small durable lifecycle record and mirror critical events to console."""
+    record = {'time': utc_iso('seconds'), 'event': event, 'reason': str(reason)[:500],
+              'pid': os.getpid(), 'version': VERSION, 'platform': platform.platform()}
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(_LIFECYCLE_PATH, 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + '\n')
+            fh.flush(); os.fsync(fh.fileno())
+    except Exception as exc:
+        print(f'[Lifecycle] Could not persist {event}: {exc}', file=sys.stderr, flush=True)
+    if event in {'startup','unclean_exit','shutdown'}:
+        print(f'[Lifecycle] {event}: {record["reason"] or "no reason supplied"}', flush=True)
+
 stream_error_log = logging.getLogger('stream_errors')
 stream_error_log.setLevel(logging.INFO)
 stream_error_log.propagate = False
 if not stream_error_log.handlers:
-    stream_error_log.addHandler(logging.handlers.RotatingFileHandler(
+    stream_error_log.addHandler(QuotaSafeRotatingFileHandler(
         os.path.join(LOG_DIR, 'stream_errors.log'),
         maxBytes=5_000_000, backupCount=3, encoding='utf-8'))
 
@@ -1397,6 +1503,10 @@ def _required_permission_for_request() -> str | None:
         return 'camera.control'
     if path.startswith('/api/') and method in {'POST','PUT','PATCH','DELETE'}:
         return 'camera.control'
+    # Default-deny for unclassified API endpoints: unknown APIs are treated as
+    # security-sensitive until an explicit least-privilege rule is added.
+    if path.startswith('/api/'):
+        return 'security.manage'
     return None
 
 def _auth_error(message: str = 'Authentication required') -> Response:
@@ -2351,8 +2461,10 @@ def _storage_allows_write(extra_bytes=0,operation='database write'):
 
 _VALIDATION_ACTIVE_LOCK = threading.Lock()
 _VALIDATION_ACTIVE_COUNT = 0
-_DB_BUSY_RETRIES = 8
-_DB_BUSY_SLEEP = 0.10
+# v181: scans and validation share SQLite; longer bounded waits prevent a transient
+# validation claim from aborting a multi-thousand-record discovery pass.
+_DB_BUSY_RETRIES = max(12, min(30, int(os.getenv('CAMERA_DB_BUSY_RETRIES', '20'))))
+_DB_BUSY_SLEEP = max(0.10, min(0.50, float(os.getenv('CAMERA_DB_BUSY_SLEEP', '0.15'))))
 # v135: background writers are deliberately rate-limited so validation,
 # retention, health and audit work cannot continuously occupy SQLite while a
 # human is using the dashboard. Foreground/API writes always get priority.
@@ -2562,7 +2674,7 @@ def _db_retry_write(fn, label='database write'):
             started = time.monotonic()
             lock_acquired = False
             if is_background:
-                lock_acquired = _DB_WRITE_LOCK.acquire(timeout=0.50)
+                lock_acquired = _DB_WRITE_LOCK.acquire(timeout=max(2.0, min(5.0, float(os.getenv('CAMERA_DB_WRITE_LOCK_TIMEOUT', '3.0')))))
                 if not lock_acquired:
                     # Record the actual contention cause. Previously this branch
                     # retried without setting `last`, producing the misleading
@@ -2865,14 +2977,41 @@ def db_compact_and_backup(actor: str = 'system') -> dict:
                     raise sqlite3.OperationalError(
                         f'WAL checkpoint is busy (busy={checkpoint[0]}, log_pages={checkpoint[1]}, checkpointed_pages={checkpoint[2]}); close other active requests and retry'
                     )
-                conn.execute('VACUUM')
-                conn.commit()
+                # VACUUM in WAL mode can produce a WAL as large as (or larger
+                # than) the database. Skip it when there is little reclaimable
+                # space, and checkpoint immediately after a real compaction.
+                page_size = int(conn.execute('PRAGMA page_size').fetchone()[0] or 4096)
+                reclaimable_bytes = before_free * page_size
+                vacuum_threshold = max(64 * 1024 * 1024, int(before_pages * page_size * 0.03))
+                if reclaimable_bytes >= vacuum_threshold:
+                    conn.execute('VACUUM')
+                    conn.commit()
+                    post_vacuum_checkpoint = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+                    if post_vacuum_checkpoint and int(post_vacuum_checkpoint[0] or 0) != 0:
+                        log.warning('[DB Maintenance] Post-VACUUM WAL checkpoint busy; WAL will be left intact for SQLite recovery')
+                else:
+                    log.info('[DB Maintenance] Skipping VACUUM: only %.1f MB reclaimable; threshold %.1f MB',
+                             reclaimable_bytes / 1048576, vacuum_threshold / 1048576)
                 after_pages = int(conn.execute('PRAGMA page_count').fetchone()[0] or 0)
                 after_free = int(conn.execute('PRAGMA freelist_count').fetchone()[0] or 0)
                 log.info('[DB Maintenance] Page audit: page_size=%s pages=%d->%d free_pages=%d->%d',
-                         conn.execute('PRAGMA page_size').fetchone()[0], before_pages, after_pages, before_free, after_free)
+                         page_size, before_pages, after_pages, before_free, after_free)
             finally:
                 conn.close()
+
+        # Re-checkpoint with a fresh connection after closing the maintenance
+        # connection, so committed VACUUM pages do not remain in a giant WAL.
+        try:
+            checkpoint_conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+            try:
+                checkpoint_conn.execute('PRAGMA busy_timeout=30000')
+                final_checkpoint = checkpoint_conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+                if final_checkpoint and int(final_checkpoint[0] or 0) != 0:
+                    log.warning('[DB Maintenance] Final WAL checkpoint busy: %s', tuple(final_checkpoint))
+            finally:
+                checkpoint_conn.close()
+        except Exception as checkpoint_error:
+            log.warning('[DB Maintenance] Final WAL checkpoint failed safely: %s', checkpoint_error)
 
         new_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
         new_wal = os.path.getsize(DB_PATH + '-wal') if os.path.exists(DB_PATH + '-wal') else 0
@@ -3816,7 +3955,7 @@ def db_bulk_upsert(cameras: list[dict]) -> int:
         INSERT INTO cameras (id,label,ip,port,camera_type,username,password,country,region,city,rtsp_urls,web_url,source_file,group_name,device_id,channel_index,channel_name,geo_source,geo_confidence)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
-            label=excluded.label, ip=excluded.ip, port=excluded.port,
+            label=CASE WHEN trim(COALESCE(excluded.label,''))='' OR lower(trim(excluded.label)) IN ('camera','unknown','generic','generic_rtsp','generic_rtsp_pending') THEN cameras.label ELSE excluded.label END, ip=excluded.ip, port=excluded.port,
             camera_type=CASE WHEN excluded.camera_type!='' THEN excluded.camera_type ELSE cameras.camera_type END,
             username=CASE WHEN excluded.username!='' THEN excluded.username ELSE cameras.username END,
             password=CASE WHEN excluded.password!='' THEN excluded.password ELSE cameras.password END,
@@ -3833,7 +3972,9 @@ def db_bulk_upsert(cameras: list[dict]) -> int:
             geo_confidence=CASE WHEN excluded.geo_confidence!='' THEN excluded.geo_confidence ELSE cameras.geo_confidence END,
             deleted=0, deleted_at=NULL, updated_at=datetime('now')
     '''
-    member_sql = '''INSERT INTO discovery_members(source_path,camera_id,last_seen) VALUES (?, ?, datetime('now')) ON CONFLICT(source_path,camera_id) DO UPDATE SET last_seen=datetime('now')'''
+    # Refresh membership at most daily. Re-scanning unchanged files should
+    # not dirty thousands of SQLite rows on every startup and inflate the WAL.
+    member_sql = '''INSERT INTO discovery_members(source_path,camera_id,last_seen) VALUES (?, ?, datetime('now')) ON CONFLICT(source_path,camera_id) DO UPDATE SET last_seen=datetime('now') WHERE discovery_members.last_seen < datetime('now','-1 day')'''
     queue_sql = '''INSERT INTO validation_queue(camera_id,priority,next_attempt,max_attempts) VALUES (?, ?, datetime('now'), ?) ON CONFLICT(camera_id) DO UPDATE SET priority=MIN(validation_queue.priority,excluded.priority),next_attempt=CASE WHEN ?=1 OR excluded.priority < validation_queue.priority THEN datetime('now') ELSE validation_queue.next_attempt END,max_attempts=MIN(validation_queue.max_attempts,excluded.max_attempts)'''
     # v136: commit each small discovery chunk independently.
     for pos in range(0, len(rows), chunk_size):
@@ -3904,7 +4045,7 @@ def _claim_validation_batch(limit: int, worker_id: str) -> list[dict]:
         return rows
 
     rows = _db_retry_write(_write, 'claim validation batch')
-    return [_db_row(r) for r in rows]
+    return rows
 
 
 def _release_validation_claims(cam_ids: list[str], worker_id: str = '') -> None:
@@ -4224,6 +4365,8 @@ def _db_get_group_stats_uncached() -> list[dict]:
         SELECT COALESCE(NULLIF(c.group_name,''), NULLIF(c.country,''), 'Unknown') AS display_group,
                MAX(NULLIF(c.area,'')) AS area, MAX(NULLIF(c.city,'')) AS city,
                MAX(NULLIF(c.region,'')) AS region, MAX(NULLIF(c.country,'')) AS country,
+               MAX(NULLIF(c.camera_type,'')) AS camera_type, MAX(NULLIF(c.ip,'')) AS sample_ip,
+               MAX(c.port) AS sample_port,
                COUNT(*) AS total, SUM(c.status='online') AS online, SUM(c.status='offline') AS offline,
                SUM(c.status='checking') AS checking, SUM(c.status='unknown') AS unknown,
                SUM(c.favorite=1) AS favorites, MIN(c.source_file) AS sample_source, MAX(c.last_seen) AS last_active
@@ -4241,16 +4384,65 @@ def _db_get_group_stats_uncached() -> list[dict]:
         location_parts = [d.get(k) for k in ('area', 'city', 'region', 'country')]
         location_parts = list(dict.fromkeys(_safe_str(x).strip() for x in location_parts if _safe_str(x).strip()))
         location_label = ', '.join(location_parts)
-        if re.match(r'^XX(?:\s|[-_:·]|$)', raw_group, re.I) and location_label:
-            d['display_title'] = location_label + re.sub(r'^XX', '', raw_group, count=1, flags=re.I)
-        else:
-            d['display_title'] = raw_group or location_label or 'Unknown location'
+        # Replace generic category labels in the visible heading with a grounded
+        # vendor label when known, otherwise a neutral RTSP-device label. Keep the
+        # original display_group untouched because it is the database filter key.
+        group_title = raw_group
+        camera_type = _safe_str(d.get('camera_type') or '').strip()
+        vendor = camera_type if camera_type.lower() not in {
+            'generic', 'generic_rtsp', 'generic_rtsp_pending', 'unknown',
+            'vendor_unsupported', 'camera', 'rtsp'
+        } else 'RTSP Device'
+        if re.search(r'\bgeneric(?:_rtsp(?:_pending)?)?\b', group_title, re.I):
+            group_title = re.sub(r'generic(?:_rtsp(?:_pending)?)?', vendor, group_title, flags=re.I)
+        if re.match(r'^XX(?:\s|[-_:·]|$)', group_title, re.I) and location_label:
+            group_title = location_label + re.sub(r'^XX', '', group_title, count=1, flags=re.I)
+        # Add an endpoint when a legacy category title contains no useful identity.
+        if not group_title or group_title.lower() in {'generic', 'unknown', 'camera'}:
+            endpoint_ip = _safe_str(d.get('sample_ip') or '').strip()
+            endpoint_port = d.get('sample_port')
+            group_title = f'{vendor} · {endpoint_ip}' + (f':{endpoint_port}' if endpoint_port else '') if endpoint_ip else (location_label or vendor)
+        d['display_title'] = group_title or location_label or 'Unknown location'
         out.append(d)
     return out
 
 
 def db_get_group_stats() -> list[dict]:
     return _cached_read('group_stats', 5.0, _db_get_group_stats_uncached)
+
+
+def _camera_display_name(cam: dict) -> str:
+    """Return a useful camera title without showing generic placeholders as names."""
+    label = _safe_str(cam.get('label') or '').strip()
+    channel_name = _safe_str(cam.get('channel_name') or '').strip()
+    camera_type = _safe_str(cam.get('camera_type') or '').strip()
+    if camera_type.lower().replace('-', '_').replace(' ', '_') in {'generic', 'generic_rtsp', 'generic_rtsp_pending', 'unknown', 'vendor_unsupported'}:
+        camera_type = 'Camera'
+    ip = _safe_str(cam.get('ip') or '').strip()
+    channel_index = cam.get('channel_index') or 0
+    generic_patterns = (
+        r'^(?:generic|camera|unknown|rtsp(?:[_ -].*)?|generic_rtsp_pending|generic_rtsp)'
+        r'(?:\s*[—-].*)?$',
+    )
+    pending_stream_label = bool(re.match(r'^supplied rtsp stream(?: \(pending\))?$', label, re.I)
+                                or re.match(r'^imported rtsp stream$', label, re.I))
+    label_is_generic = (not label or label.lower() in {'camera', 'unknown', 'generic', 'generic_rtsp', 'generic_rtsp_pending'}
+                        or any(re.match(pattern, label, re.I) for pattern in generic_patterns)
+                        or pending_stream_label)
+    if channel_name and channel_name.lower() not in {'channel', 'unknown', 'rtsp pending'} and not re.search(r'rtsp pending', channel_name, re.I):
+        name = channel_name
+    elif pending_stream_label:
+        name = f'Channel {int(channel_index or 1)} — RTSP pending' if 'pending' in label.lower() else f'Channel {int(channel_index or 1)} — RTSP stream'
+    elif not label_is_generic:
+        name = label
+    elif channel_index:
+        name = f'{camera_type or "Camera"} — Channel {channel_index}'
+    else:
+        name = f'{camera_type or "Camera"} — {ip}' if ip else 'Unnamed camera'
+    # Avoid titles that are just an IP address or a generic vendor label.
+    if name.lower() in {'generic', 'camera', 'unknown', 'generic_rtsp_pending', 'generic_rtsp'}:
+        name = f'{camera_type or "Camera"} — {ip}' if ip else 'Unnamed camera'
+    return name[:180]
 
 
 def db_get_cameras_by_group(display_group: str, limit: int = PAGE_SIZE,
@@ -4275,7 +4467,10 @@ def db_get_cameras_by_group(display_group: str, limit: int = PAGE_SIZE,
         f'SELECT c.* FROM cameras c WHERE c.deleted=0 AND {where} '
         f'ORDER BY {_STATUS_SORT.replace("status","c.status")}, COALESCE(c.last_seen,"") DESC, c.ip LIMIT ? OFFSET ?',
         params+[max(1,int(limit)),max(0,int(offset))]).fetchall()
-    return [_db_row(r) for r in rows]
+    result = [_db_row(r) for r in rows]
+    for cam in result:
+        cam['display_name'] = _camera_display_name(cam)
+    return result
 
 
 def db_get_group_count(display_group: str) -> int:
@@ -5941,14 +6136,26 @@ def _send_telegram_document(content: bytes, filename: str,
     return (sent > 0), (f'Sent to {sent}' if sent else '; '.join(errors))
 
 
-def _build_camera_export() -> bytes:
-    """Build a compressed JSONL export for Telegram safekeeping."""
+def _build_camera_export(include_credentials: bool = False) -> bytes:
+    """Build a compressed JSONL export without fetching all rows at once.
+
+    Credentials are omitted by default. Credential-inclusive exports require an
+    explicit trusted internal call and CAMERA_ALLOW_CREDENTIAL_EXPORT=1.
+    """
+    if include_credentials and os.getenv('CAMERA_ALLOW_CREDENTIAL_EXPORT', '').strip().lower() not in {'1','true','yes'}:
+        raise PermissionError('Credential-inclusive export is disabled; set CAMERA_ALLOW_CREDENTIAL_EXPORT=1 only for a trusted backup workflow.')
     out = io.BytesIO()
+    credential_keys = {'username','password','user','pass','rtsp_url','url','stream_url','credential','credentials','auth'}
     with gzip.GzipFile(fileobj=out, mode='wb', compresslevel=6) as gz:
-        rows = _db_conn().execute(
-            'SELECT * FROM cameras WHERE deleted=0 ORDER BY id').fetchall()
-        for row in rows:
-            gz.write((json.dumps(dict(row), ensure_ascii=False) + '\n').encode('utf-8'))
+        cursor = _db_conn().execute('SELECT * FROM cameras WHERE deleted=0 ORDER BY id')
+        for row in cursor:
+            item = dict(row)
+            if not include_credentials:
+                for key in list(item):
+                    normalized = str(key).strip().lower()
+                    if normalized in credential_keys or any(token in normalized for token in ('password','passwd','secret','credential','rtsp_url','stream_url')):
+                        item.pop(key, None)
+            gz.write((json.dumps(item, ensure_ascii=False, default=str) + '\n').encode('utf-8'))
     return out.getvalue()
 
 
@@ -6225,6 +6432,8 @@ _HTML_CAM_GRID = r"""
       </div>
     </div>
 
+    <div class="cam-name" title="{{ cam.display_name | e }}">{{ cam.display_name | e }}</div>
+
     {% if cam.ip %}
     <div class="cam-ip">
       <span class="sdot {{ cam.status }}">&#9679;</span>
@@ -6428,7 +6637,7 @@ canvas.live,img.live{width:100%;height:100%;object-fit:contain;display:block}
 .sdot.checking{color:#d29922}
 .sdot.offline {color:#f85149}
 .cam-cred{font-family:monospace;font-size:11px;color:var(--yellow)}
-.cam-location{font-size:11px;color:var(--muted)}
+.cam-name{font-size:12px;font-weight:700;color:var(--text);line-height:1.35;overflow-wrap:anywhere;margin:3px 0 2px}.cam-location{font-size:11px;color:var(--muted)}
 .cam-ts{font-size:10px;color:var(--muted);font-family:monospace}
 .meta-row{display:flex;gap:3px;flex-wrap:wrap;margin:1px 0}
 .meta-badge{padding:1px 5px;border-radius:4px;font-size:10px;font-weight:600;
@@ -9073,7 +9282,7 @@ def _scan_and_upsert(force: bool = False) -> list[dict]:
             _scan_state_set(discovered=totals['discovered'],processed=totals['processed'],added=totals['added'],updated=totals['updated'])
             now = time.monotonic()
             if last_progress_log[0] == 0.0 or now - last_progress_log[0] >= 5.0:
-                log.info('[Scanner] Live progress: discovered=%d processed=%d added=%d updated=%d failed=%d',
+                log.info('[Scanner] Live progress: records_seen=%d processed=%d new_camera_ids=%d existing_camera_ids_updated=%d failed=%d',
                          totals['discovered'], totals['processed'], totals['added'], totals['updated'], totals['failed'])
                 last_progress_log[0] = now
         except Exception as exc:
@@ -9086,7 +9295,7 @@ def _scan_and_upsert(force: bool = False) -> list[dict]:
             db_reconcile_source(source_file,found_ids)
         if not _SCAN_CANCEL.is_set(): db_prune_deleted(limit=1000,retention_days=DELETED_RETENTION_DAYS)
         finished=utc_iso(); _scan_state_set(running=False,phase='cancelled' if _SCAN_CANCEL.is_set() else 'complete',cancel_requested=_SCAN_CANCEL.is_set(),finished_at=finished,last_scan_at=finished,**totals)
-        log.info('[Scanner] %s: discovered=%d processed=%d added=%d updated=%d skipped=%d failed=%d',
+        log.info('[Scanner] %s: records_seen=%d processed=%d new_camera_ids=%d existing_camera_ids_updated=%d skipped=%d failed=%d',
                  'Cancelled' if _SCAN_CANCEL.is_set() else 'Complete',
                  totals['discovered'], totals['processed'], totals['added'],
                  totals['updated'], totals['skipped'], totals['failed'])
@@ -15914,6 +16123,18 @@ def main() -> None:
         if os.getenv('CAMERA_ALLOW_LOOPBACK_HOST', '').strip().lower() not in {'1', 'true', 'yes'}:
             log.warning('[HTTP] Hosted environment detected; overriding loopback bind %s with 0.0.0.0', args.host)
             args.host = '0.0.0.0'
+    # Fail closed for any non-loopback bind. A reachable dashboard must not
+    # silently run as an unauthenticated admin when environment variables are missing.
+    network_exposed = args.host.strip().lower() not in {'127.0.0.1', 'localhost', '::1'}
+    if network_exposed and not (AUTH_ENABLED_CONFIG and AUTH_USER and AUTH_PASSWORD):
+        message = ('SECURITY ERROR: network-exposed binding requires CAMERA_AUTH_ENABLED=1, '
+                   'CAMERA_ADMIN_USER and a strong CAMERA_ADMIN_PASSWORD. '
+                   'For local-only use, bind to 127.0.0.1.')
+        print(message, file=sys.stderr, flush=True)
+        raise SystemExit(2)
+    if network_exposed:
+        log.warning('[Security] Network bind requires authenticated sessions; secure_cookie=%s', SECURE_COOKIE)
+
     worker_arg = str(args.workers).strip().lower()
     if worker_arg != 'auto':
         if not worker_arg.isdigit() or not 1 <= int(worker_arg) <= 64:
@@ -15955,6 +16176,8 @@ def main() -> None:
     # the final DB_PATH. This prevents two dashboard processes from sharing the
     # same SQLite database while still allowing separate data directories.
     _acquire_pid_lock()
+    _lifecycle_event('startup', f'host={args.host} port={args.port}')
+    atexit.register(lambda: _lifecycle_event('shutdown', 'process exiting; graceful reason may be unavailable'))
     _ensure_tg_template()
     db_init(allow_create_if_missing=bool(args.create_db_if_missing))
     _v43_ensure_schema()
