@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v196.0 — Reliable M3U Upload and Import
+Camera Dashboard v197.0 — Reliable Import, Streaming Export, Runtime Safety
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '196.0'
+VERSION = '197.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -677,6 +677,9 @@ app.secret_key = os.getenv('SESSION_SECRET') or os.urandom(24)
 if not os.getenv('SESSION_SECRET'):
     log.warning('SESSION_SECRET is not set; sessions will be invalidated on restart. Set a persistent CAMERA/SESSION secret for production.')
 app.config.update(
+    MAX_CONTENT_LENGTH=max(1 * 1024 * 1024, min(128 * 1024 * 1024,
+        int(os.getenv('CAMERA_MAX_UPLOAD_BYTES', str(64 * 1024 * 1024))))),
+    MAX_FORM_MEMORY_SIZE=2 * 1024 * 1024,
     SESSION_COOKIE_NAME='camera_dashboard_session',
     SESSION_COOKIE_PATH='/',
     SESSION_COOKIE_HTTPONLY=True,
@@ -2797,6 +2800,10 @@ def _db_retry_write(fn, label='database write'):
         except sqlite3.OperationalError as exc:
             last = exc
             msg = str(exc).lower()
+            if any(token in msg for token in ('disk is full', 'database or disk is full', 'disk quota exceeded', 'no space left')):
+                log.critical('[Storage] SQLite write failed because storage is full/quota-exhausted; operation=%s error=%s',
+                             label, type(exc).__name__)
+                raise
             if 'locked' not in msg and 'busy' not in msg:
                 raise
             try:
@@ -2881,6 +2888,52 @@ def _remove_sqlite_temp_family(path: str) -> None:
             pass
         except OSError as exc:
             log.warning('[SQLite] Could not remove temporary file %s: %s', candidate, exc)
+
+
+def _publish_independent_backup_history(primary_backup: str) -> bool:
+    """Copy a verified backup to a separately configured history directory.
+
+    Set CAMERA_BACKUP_HISTORY_DIR to persistent storage independent from the
+    project/source directory (ideally a different volume). Keep a bounded number
+    of copies. A secondary-history failure never invalidates the primary backup.
+    """
+    target_dir = os.getenv('CAMERA_BACKUP_HISTORY_DIR', '').strip()
+    if not target_dir:
+        return False
+    target_dir = os.path.abspath(os.path.expanduser(target_dir))
+    try:
+        if os.path.commonpath([target_dir, os.path.abspath(DATA_DIR)]) == os.path.abspath(DATA_DIR):
+            log.warning('[Backup history] configured directory is inside DATA_DIR; it is not independent storage: %s', target_dir)
+        os.makedirs(target_dir, mode=0o700, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        final_path = os.path.join(target_dir, f'camera_db-{stamp}-{os.getpid()}.sqlite.bak')
+        temp_path = final_path + '.tmp'
+        shutil.copy2(primary_backup, temp_path)
+        if not _sqlite_quick_check_ok(temp_path):
+            raise sqlite3.DatabaseError('secondary backup failed quick_check')
+        with open(temp_path, 'rb') as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp_path, final_path)
+        keep = max(2, min(30, int(os.getenv('CAMERA_BACKUP_HISTORY_KEEP', '5'))))
+        files = sorted(
+            (os.path.join(target_dir, name) for name in os.listdir(target_dir)
+             if name.startswith('camera_db-') and name.endswith('.sqlite.bak')),
+            key=lambda item: os.path.getmtime(item), reverse=True)
+        for stale in files[keep:]:
+            try: os.remove(stale)
+            except OSError as exc:
+                log.warning('[Backup history] could not remove old copy %s: %s', stale, exc)
+        log.info('[Backup history] independent verified copy created: %s (retained=%d)', final_path, min(len(files) + 1, keep))
+        return True
+    except Exception as exc:
+        log.error('[Backup history] secondary copy failed; primary backup remains valid: %s: %s',
+                  type(exc).__name__, exc)
+        try:
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        return False
 
 
 def db_create_backup(clean_old: bool = True, _shutdown: bool = False) -> bool:
@@ -2975,7 +3028,8 @@ def db_create_backup(clean_old: bool = True, _shutdown: bool = False) -> bool:
             os.replace(tmp, DB_BACKUPS[0])
             if clean_old:
                 _cleanup_old_database_backups(DB_BACKUPS[0])
-        log.info('SQLite backup created: %s (single-backup policy)', DB_BACKUPS[0])
+        log.info('SQLite backup created: %s (primary verified backup)', DB_BACKUPS[0])
+        _publish_independent_backup_history(DB_BACKUPS[0])
         return True
     except TimeoutError as e:
         log.warning('SQLite backup deferred/aborted: %s', e)
@@ -6306,54 +6360,75 @@ def _send_telegram(message: str, photo_path: str = '') -> tuple[bool, str]:
     return (sent > 0), (f'Sent to {sent}' if sent else '; '.join(errors))
 
 
-def _send_telegram_document(content: bytes, filename: str,
+def _send_telegram_document(content, filename: str,
                             caption: str = '') -> tuple[bool, str]:
+    """Send bytes or a file path without loading a large export into RAM."""
     if _requests is None:
         return False, 'requests library not installed'
     dests = _load_tg_destinations()
     if not dests:
         return False, 'Telegram not configured. Open Telegram Settings and save an encrypted configuration.'
-    if len(content) > 49 * 1024 * 1024:
+    is_path = isinstance(content, (str, os.PathLike))
+    size = os.path.getsize(content) if is_path else len(content)
+    if size > 49 * 1024 * 1024:
         return False, 'Export is larger than Telegram document limit'
     sent, errors = 0, []
     for dest in dests:
+        fh = None
         try:
+            if is_path:
+                fh = open(content, 'rb')
+                payload = (filename, fh, 'application/gzip')
+            else:
+                payload = (filename, io.BytesIO(content), 'application/gzip')
             r = _requests.post(
                 f"https://api.telegram.org/bot{dest['bot_token']}/sendDocument",
                 data={'chat_id': str(dest['chat_id']), 'caption': caption[:1024]},
-                files={'document': (filename, io.BytesIO(content),
-                                    'application/gzip')},
-                timeout=45)
+                files={'document': payload}, timeout=90)
             if r.ok:
                 sent += 1
             else:
                 errors.append(f"{dest.get('name','?')}: Telegram HTTP {r.status_code}")
         except Exception:
             errors.append(f"{dest.get('name','?')}: request failed")
+        finally:
+            if fh:
+                try: fh.close()
+                except Exception: pass
     return (sent > 0), (f'Sent to {sent}' if sent else '; '.join(errors))
 
 
-def _build_camera_export(include_credentials: bool = False) -> bytes:
-    """Build a compressed JSONL export without fetching all rows at once.
-
-    Credentials are omitted by default. Credential-inclusive exports require an
-    explicit trusted internal call and CAMERA_ALLOW_CREDENTIAL_EXPORT=1.
-    """
+def _build_camera_export_file(include_credentials: bool = False) -> str:
+    """Write a gzipped JSONL export to disk using an explicit metadata allowlist."""
     if include_credentials and os.getenv('CAMERA_ALLOW_CREDENTIAL_EXPORT', '').strip().lower() not in {'1','true','yes'}:
         raise PermissionError('Credential-inclusive export is disabled; set CAMERA_ALLOW_CREDENTIAL_EXPORT=1 only for a trusted backup workflow.')
-    out = io.BytesIO()
-    credential_keys = {'username','password','user','pass','rtsp_url','url','stream_url','credential','credentials','auth'}
-    with gzip.GzipFile(fileobj=out, mode='wb', compresslevel=6) as gz:
-        cursor = _db_conn().execute('SELECT * FROM cameras WHERE deleted=0 ORDER BY id')
-        for row in cursor:
-            item = dict(row)
-            if not include_credentials:
-                for key in list(item):
-                    normalized = str(key).strip().lower()
-                    if normalized in credential_keys or any(token in normalized for token in ('password','passwd','secret','credential','rtsp_url','stream_url')):
-                        item.pop(key, None)
-            gz.write((json.dumps(item, ensure_ascii=False, default=str) + '\n').encode('utf-8'))
-    return out.getvalue()
+    allowed_fields = (
+        'id', 'label', 'ip', 'port', 'camera_type', 'country', 'region', 'city',
+        'web_url', 'source_file', 'group_name', 'device_id', 'channel_index',
+        'channel_name', 'geo_source', 'geo_confidence', 'status', 'last_seen',
+        'last_checked', 'created_at', 'updated_at', 'favorite', 'notes'
+    )
+    if include_credentials:
+        allowed_fields += ('username', 'password', 'rtsp_urls')
+    fd, path = tempfile.mkstemp(prefix='camera-export-', suffix='.jsonl.gz', dir=DATA_DIR)
+    os.close(fd)
+    try:
+        with open(path, 'wb') as raw:
+            with gzip.GzipFile(fileobj=raw, mode='wb', compresslevel=6) as gz:
+                cursor = _db_conn().execute('SELECT * FROM cameras WHERE deleted=0 ORDER BY id')
+                columns = set(cursor.description[i][0] for i in range(len(cursor.description)))
+                selected = [field for field in allowed_fields if field in columns]
+                for row in cursor:
+                    item = {field: row[field] for field in selected}
+                    if not include_credentials:
+                        # No RTSP URL, username or password is included in default exports.
+                        pass
+                    gz.write((json.dumps(item, ensure_ascii=False, default=str) + '\n').encode('utf-8'))
+        return path
+    except Exception:
+        try: os.remove(path)
+        except OSError: pass
+        raise
 
 
 _tg_transition_lock = threading.Lock()
@@ -8790,13 +8865,33 @@ function submitM3u(e) {
   prog.textContent = '⏳ Uploading…'; prog.style.display = ''; submit.disabled = true;
   const fd = new FormData(); fd.append('file', file);
   fetch('/upload_m3u', {method:'POST', body: fd})
-    .then(r => r.json()).then(d => {
-      if (d.ok) {
-        document.getElementById('m3u-modal').close();
-        showToast('✅ ' + d.filename + ' — ' + d.count + ' streams — reloading…');
-        setTimeout(() => location.reload(), 1400);
-      } else { prog.textContent = '❌ ' + d.detail; submit.disabled = false; }
-    }).catch(err => { prog.textContent = '❌ ' + err; submit.disabled = false; });
+    .then(async r => {
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) throw Error(d.detail || ('Upload failed (HTTP ' + r.status + ')'));
+      if (!d.job_id) throw Error(d.detail || 'Server did not create an import job');
+      prog.textContent = '✅ Upload received. Importing…'; submit.disabled = true;
+      const poll = async () => {
+        try {
+          const r2 = await fetch('/api/import/status/' + encodeURIComponent(d.job_id), {cache:'no-store'});
+          const s = await r2.json();
+          if (!r2.ok || !s.ok) throw Error(s.detail || 'Import status unavailable');
+          prog.textContent = (s.status === 'completed' ? '✅ ' : s.status === 'failed' ? '❌ ' : '⏳ ')
+            + (s.message || s.status) + (s.parsed ? ' · parsed ' + s.parsed : '')
+            + (s.upserted ? ' · saved ' + s.upserted : '');
+          if (s.status === 'completed') {
+            document.getElementById('m3u-modal').close();
+            showToast('✅ ' + s.filename + ' — ' + s.upserted + ' records imported — reloading…');
+            setTimeout(() => location.reload(), 1400); return;
+          }
+          if (s.status === 'failed') { submit.disabled = false; return; }
+          setTimeout(poll, 1200);
+        } catch (err) {
+          prog.textContent = '❌ Import status error: ' + err.message;
+          submit.disabled = false;
+        }
+      };
+      setTimeout(poll, 500);
+    }).catch(err => { prog.textContent = '❌ ' + err.message; submit.disabled = false; });
 }
 
 async function previewM3u() {
@@ -12822,37 +12917,16 @@ def add_camera() -> Response:
         return jsonify({'ok': False, 'detail': _mask_rtsp(str(e))})
 
 
-@app.route('/upload_m3u', methods=['POST'])
-def upload_m3u() -> Response:
-    """Upload, parse and persist an M3U/TXT/CSV/XML file with actionable errors.
+_M3U_IMPORT_LOCK = threading.RLock()
+_M3U_IMPORT_JOBS: dict[str, dict] = {}
+_M3U_IMPORT_JOBS_MAX = 100
 
-    All request parsing, disk writes, parsing and DB writes are guarded. A failed
-    request no longer escapes from FileStorage.save() before the error handler.
-    """
-    upload_name = ''
-    temp_path = ''
+
+def _m3u_import_job(job_id: str, temp_path: str, dest: str,
+                    safe_name: str, ext: str) -> None:
+    state = _M3U_IMPORT_JOBS[job_id]
     try:
-        # Accessing request.files itself can raise BadRequest for malformed multipart
-        # requests, so it must be inside this try block.
-        f = request.files.get('file')
-        if not f or not (f.filename or '').strip():
-            return jsonify({'ok': False, 'detail': 'No file selected. Choose an M3U file and try again.'}), 400
-
-        upload_name = os.path.basename(f.filename or 'playlist.m3u')
-        ext = os.path.splitext(upload_name)[1].lower()
-        if ext not in {'.m3u', '.m3u8', '.txt', '.csv', '.xml'}:
-            return jsonify({
-                'ok': False,
-                'detail': 'Unsupported file type. Upload .m3u, .m3u8, .txt, .csv, or .xml.'
-            }), 400
-
-        safe = re.sub(r'[^\w.\-]', '_', upload_name) or ('playlist' + ext)
-        os.makedirs(_SEARCH_DIR, exist_ok=True)
-        fd, temp_path = tempfile.mkstemp(prefix='.upload-', suffix=ext, dir=_SEARCH_DIR)
-        os.close(fd)
-        f.save(temp_path)
-
-        # Parse the temporary upload before replacing any existing source file.
+        state.update(status='parsing', message='Parsing uploaded file')
         if ext in ('.m3u', '.m3u8'):
             cams = _parse_m3u_file(temp_path)
         elif ext == '.csv':
@@ -12860,73 +12934,176 @@ def upload_m3u() -> Response:
         elif ext == '.xml':
             cams = _parse_xml_file(temp_path)
         else:
-            content = Path(temp_path).read_text(encoding='utf-8-sig', errors='ignore')
-            if re.search(r'camera\s+type\s*:|ip\s+address\s*:', content, re.I):
+            # Stream TXT lines for RTSP playlists; only use whole-file parsing
+            # for structured camera inventory blocks.
+            with open(temp_path, 'r', encoding='utf-8-sig', errors='ignore') as fh:
+                prefix = fh.read(256 * 1024)
+            if re.search(r'camera\s+type\s*:|ip\s+address\s*:', prefix, re.I):
+                content = Path(temp_path).read_text(encoding='utf-8-sig', errors='ignore')
                 cams = []
                 for block in re.split(r'={10,}', content):
                     cam = _parse_valid_camera_block(block, temp_path)
                     if cam:
                         cams.append(cam)
-                if not cams and re.search(r'(?i)rtsps?://', content):
+                if not cams and re.search(r'(?i)rtsps?://', prefix):
                     cams = _parse_rtsp_file(temp_path)
             else:
                 cams = _parse_rtsp_file(temp_path)
 
         if not cams:
-            log.warning('[M3U upload] rejected filename=%s reason=no_supported_records',
-                        safe)
-            return jsonify({
-                'ok': False,
-                'category': 'no_supported_records',
-                'detail': 'The file was received but no supported camera/RTSP records were found. Check that it contains RTSP URLs, one per line, or valid #EXTINF + RTSP entries.'
-            }), 400
+            state.update(status='failed', message='No supported camera/RTSP records found',
+                         error_category='no_supported_records', parsed=0, upserted=0)
+            log.warning('[M3U upload] job=%s rejected filename=%s reason=no_supported_records',
+                        job_id, safe_name)
+            return
 
-        # Persist the stable final source path in each record before upserting.
-        dest = os.path.join(_SEARCH_DIR, safe)
+        state.update(status='importing', parsed=len(cams), message=f'Importing {len(cams)} records')
         for cam in cams:
             cam['source_file'] = dest
 
-        inserted_or_updated = db_bulk_upsert(cams)
-        # Only publish the uploaded source file after the DB upsert succeeded.
-        os.replace(temp_path, dest)
-        temp_path = ''
-        log.info('[M3U upload] success filename=%s parsed=%d upserted=%d',
-                 safe, len(cams), int(inserted_or_updated or 0))
-        return jsonify({
-            'ok': True, 'filename': safe, 'count': len(cams),
-            'queued': len(cams),
-            'message': f'Imported {len(cams)} camera stream(s). Existing IDs were updated; new IDs were inserted.'
-        }), 200
+        # Chunk DB writes so UI and validation requests can continue to make progress.
+        chunk_size = max(25, min(250, int(os.getenv('CAMERA_IMPORT_BATCH_SIZE', '100'))))
+        total = 0
+        for pos in range(0, len(cams), chunk_size):
+            chunk = cams[pos:pos + chunk_size]
+            total += int(db_bulk_upsert(chunk) or 0)
+            state.update(upserted=total, progress=min(99, int(100 * min(pos + len(chunk), len(cams)) / len(cams))))
+            if pos + chunk_size < len(cams):
+                _shutdown_requested.wait(0.03)
 
+        # Never report success if shutdown cancelled a background SQLite write
+        # or any parsed rows were not acknowledged by the database writer.
+        if total != len(cams):
+            raise RuntimeError(
+                f'partial database import: parsed={len(cams)} acknowledged_upserts={total}; '
+                'source file was not published as a successful import')
+        # Publish source file only after every database chunk is acknowledged.
+        os.replace(temp_path, dest)
+        state.update(status='completed', progress=100, upserted=total,
+                     message=f'Imported {len(cams)} camera records',
+                     completed_at=utc_iso())
+        log.info('[M3U upload] success job=%s filename=%s parsed=%d upserted=%d',
+                 job_id, safe_name, len(cams), total)
     except OSError as exc:
-        # ENOSPC/EDQUOT and other filesystem errors are common causes of an
-        # upload appearing to fail with a bare 400 in hosted environments.
-        import errno as _errno
-        if exc.errno in (getattr(_errno, 'ENOSPC', 28),
-                         getattr(_errno, 'EDQUOT', 122)):
-            detail = 'Upload could not be saved because the project storage quota is full. Free storage and retry.'
-            log.error('[M3U upload] storage quota failure filename=%s errno=%s',
-                      upload_name, exc.errno)
-            return jsonify({'ok': False, 'category': 'storage_quota', 'detail': detail}), 507
-        log.exception('[M3U upload] filesystem failure filename=%s', upload_name)
-        return jsonify({
-            'ok': False, 'category': 'filesystem_error',
-            'detail': f'Could not save/read the upload ({type(exc).__name__}). Check the project data directory and permissions.'
-        }), 500
+        category = 'storage_quota' if exc.errno in (getattr(errno, 'ENOSPC', 28),
+                                                     getattr(errno, 'EDQUOT', 122)) else 'filesystem_error'
+        message = ('Storage quota is full; free project storage and retry.'
+                   if category == 'storage_quota'
+                   else f'Filesystem failure ({type(exc).__name__})')
+        state.update(status='failed', error_category=category, message=message,
+                     completed_at=utc_iso())
+        log.exception('[M3U upload] background filesystem failure job=%s filename=%s',
+                      job_id, safe_name)
     except Exception as exc:
-        # Avoid returning exception text that could contain RTSP credentials.
+        state.update(status='failed', error_category='import_failed',
+                     message=f'Import failed ({type(exc).__name__}); see server log',
+                     completed_at=utc_iso())
+        log.exception('[M3U upload] background import failure job=%s filename=%s',
+                      job_id, safe_name)
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        with _M3U_IMPORT_LOCK:
+            # Keep recent job status for polling, but bound memory use.
+            if len(_M3U_IMPORT_JOBS) > _M3U_IMPORT_JOBS_MAX:
+                finished = [k for k, v in _M3U_IMPORT_JOBS.items()
+                            if v.get('status') in {'completed', 'failed'} and k != job_id]
+                for old_id in finished[:max(0, len(_M3U_IMPORT_JOBS) - _M3U_IMPORT_JOBS_MAX)]:
+                    _M3U_IMPORT_JOBS.pop(old_id, None)
+
+
+@app.route('/upload_m3u', methods=['POST'])
+def upload_m3u() -> Response:
+    """Stage an upload to disk and return quickly; import/upsert runs in a worker."""
+    upload_name = ''
+    temp_path = ''
+    try:
+        f = request.files.get('file')
+        if not f or not (f.filename or '').strip():
+            return jsonify({'ok': False, 'detail': 'No file selected. Choose an M3U file and try again.'}), 400
+
+        upload_name = os.path.basename(f.filename or 'playlist.m3u')
+        ext = os.path.splitext(upload_name)[1].lower()
+        if ext not in {'.m3u', '.m3u8', '.txt', '.csv', '.xml'}:
+            return jsonify({'ok': False, 'detail': 'Unsupported file type. Upload .m3u, .m3u8, .txt, .csv, or .xml.'}), 400
+
+        safe_name = re.sub(r'[^\w.\-]', '_', upload_name) or ('playlist' + ext)
+        os.makedirs(_SEARCH_DIR, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix='.upload-', suffix=ext, dir=_SEARCH_DIR)
+        os.close(fd)
+        f.save(temp_path)
+        if os.path.getsize(temp_path) <= 0:
+            return jsonify({'ok': False, 'detail': 'Uploaded file is empty.'}), 400
+
+        dest = os.path.join(_SEARCH_DIR, safe_name)
+        job_id = uuid.uuid4().hex[:16]
+        with _M3U_IMPORT_LOCK:
+            _M3U_IMPORT_JOBS[job_id] = {
+                'job_id': job_id, 'filename': safe_name, 'status': 'queued',
+                'progress': 0, 'parsed': 0, 'upserted': 0,
+                'message': 'Upload received; import queued', 'created_at': utc_iso()
+            }
+        thread = threading.Thread(target=_m3u_import_job,
+                                  args=(job_id, temp_path, dest, safe_name, ext),
+                                  daemon=True, name=f'm3u-import-{job_id}')
+        thread.start()
+        temp_path = ''
+        log.info('[M3U upload] accepted job=%s filename=%s bytes=%d',
+                 job_id, safe_name, int(request.content_length or 0))
+        return jsonify({'ok': True, 'accepted': True, 'job_id': job_id,
+                        'filename': safe_name, 'message': 'Upload received; import is running.'}), 202
+
+    except Exception as exc:
+        # Werkzeug raises ClientDisconnected while reading multipart request bodies
+        # when the browser/proxy closes the connection. Do not misreport it as an
+        # internal parser/DB failure or emit a full traceback for this normal case.
+        try:
+            from werkzeug.exceptions import ClientDisconnected, RequestEntityTooLarge
+        except Exception:
+            ClientDisconnected = type('_NoClientDisconnected', (Exception,), {})
+            RequestEntityTooLarge = type('_NoRequestEntityTooLarge', (Exception,), {})
+        if isinstance(exc, ClientDisconnected):
+            log.warning('[M3U upload] client disconnected while receiving filename=%s; no import job created',
+                        upload_name or '(not received)')
+            return jsonify({'ok': False, 'category': 'client_disconnected',
+                            'detail': 'The browser or hosting proxy disconnected before the upload completed. Retry the upload; no import job was started.'}), 400
+        if isinstance(exc, RequestEntityTooLarge):
+            log.warning('[M3U upload] rejected oversized upload filename=%s limit=%d',
+                        upload_name, int(app.config.get('MAX_CONTENT_LENGTH') or 0))
+            return jsonify({'ok': False, 'category': 'upload_too_large',
+                            'detail': 'Upload exceeds the configured file-size limit. Increase CAMERA_MAX_UPLOAD_BYTES if appropriate.'}), 413
+        if isinstance(exc, OSError):
+            category = 'storage_quota' if exc.errno in (getattr(errno, 'ENOSPC', 28),
+                                                         getattr(errno, 'EDQUOT', 122)) else 'filesystem_error'
+            status = 507 if category == 'storage_quota' else 500
+            detail = ('Project storage quota is full. Free storage and retry.'
+                      if category == 'storage_quota'
+                      else f'Could not save the upload ({type(exc).__name__}). Check data-directory permissions.')
+            log.error('[M3U upload] file failure filename=%s type=%s errno=%s',
+                      upload_name, type(exc).__name__, exc.errno)
+            return jsonify({'ok': False, 'category': category, 'detail': detail}), status
         log.exception('[M3U upload] failed filename=%s error_type=%s',
                       upload_name, type(exc).__name__)
-        return jsonify({
-            'ok': False, 'category': 'import_failed',
-            'detail': f'Import failed ({type(exc).__name__}). The server log contains the diagnostic; the uploaded file was not reported as imported.'
-        }), 500
+        return jsonify({'ok': False, 'category': 'upload_failed',
+                        'detail': f'Upload failed ({type(exc).__name__}); check server logs.'}), 500
     finally:
         if temp_path:
             try:
                 os.remove(temp_path)
             except OSError:
                 pass
+
+
+@app.route('/api/import/status/<job_id>', methods=['GET'])
+def m3u_import_status(job_id: str) -> Response:
+    with _M3U_IMPORT_LOCK:
+        state = _M3U_IMPORT_JOBS.get(job_id)
+        if not state:
+            return jsonify({'ok': False, 'detail': 'Import job not found or expired'}), 404
+        return jsonify({'ok': True, **dict(state)})
 
 
 @app.route('/snapshot/<cam_id>')
@@ -13384,12 +13561,17 @@ def telegram_status() -> Response:
 @app.route('/api/telegram/camera-list', methods=['POST'])
 def telegram_camera_list() -> Response:
     try:
-        export = _build_camera_export()
-        stats = db_get_stats()
-        ok, detail = _send_telegram_document(
-            export, 'camera-dashboard-export.jsonl.gz',
-            f"📦 Camera database export · {stats.get('total', 0)} active cameras")
-        return jsonify({'ok': ok, 'detail': detail, 'bytes': len(export)})
+        export_path = _build_camera_export_file()
+        try:
+            stats = db_get_stats()
+            size = os.path.getsize(export_path)
+            ok, detail = _send_telegram_document(
+                export_path, 'camera-dashboard-export.jsonl.gz',
+                f"📦 Camera database export · {stats.get('total', 0)} active cameras")
+            return jsonify({'ok': ok, 'detail': detail, 'bytes': size})
+        finally:
+            try: os.remove(export_path)
+            except OSError: pass
     except Exception:
         log.exception('Telegram camera export failed')
         return jsonify({'ok': False, 'detail': 'Camera export failed'}), 500
@@ -16498,6 +16680,11 @@ def main() -> None:
 
     os.umask(0o077)
     DATA_DIR=os.path.abspath(args.data_dir); os.makedirs(DATA_DIR,exist_ok=True)
+    try:
+        if os.path.commonpath([DATA_DIR, SCRIPT_DIR]) == os.path.abspath(SCRIPT_DIR):
+            log.warning('[Storage/Git] Runtime data directory is inside the source tree. Configure --data-dir or CAMERA_DATA_DIR to a persistent data location and exclude DB/WAL/SHM/backups from Git/LFS to avoid large runtime files in source history.')
+    except (ValueError, OSError):
+        pass
     try: os.chmod(DATA_DIR,0o700)
     except OSError: pass
     SNAPSHOT_DIR=os.path.join(DATA_DIR,'snapshots'); LOG_DIR=os.path.join(DATA_DIR,'logs'); DB_PATH=os.path.join(DATA_DIR,'camera_db.sqlite'); DB_BACKUPS=[DB_PATH+'.bak']; DB_BACKUP_GLOB_PREFIX=DB_PATH+'.bak'; TG_CONFIG=os.path.join(DATA_DIR,'telegram_config.json'); RTSP_SAVE=os.path.join(DATA_DIR,'generated_rtsp_links.txt')
