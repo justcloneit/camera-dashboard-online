@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v197.0 — Reliable Import, Streaming Export, Runtime Safety
+Camera Dashboard v198.0 — Quota-Safe SQLite Startup Protection
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '197.0'
+VERSION = '198.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -2152,18 +2152,28 @@ def _install_shutdown_signal_handlers() -> None:
         log.warning('Could not install shutdown signal handlers: %s', e)
 
 
-def _sqlite_fast_probe_ok(path: str) -> bool:
-    """Very fast SQLite structural probe used on the startup critical path.
+def _sqlite_environmental_io_error(exc: BaseException) -> bool:
+    """Distinguish quota/filesystem I/O failures from evidence of DB corruption."""
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        'disk i/o error', 'disk is full', 'database or disk is full',
+        'disk quota exceeded', 'no space left on device',
+        'input/output error', 'unable to open database file'
+    ))
 
-    A PRAGMA quick_check(1) can still scan a large database and was observed
-    taking several minutes. Startup must not be held hostage by a full-table
-    diagnostic. This probe opens the database read-only, verifies the SQLite
-    header/schema can be read, checks the cameras table exists when expected,
-    and reads one row without scanning the table. Deeper integrity checks are
-    performed by the optional maintenance/integrity service instead.
-    """
-    if not os.path.exists(path) or os.path.getsize(path) <= 0:
+
+def _sqlite_fast_probe_ok(path: str) -> bool:
+    """Read-only structural probe; environmental I/O failures abort recovery decisions."""
+    if not os.path.exists(path):
         return False
+    try:
+        if os.path.getsize(path) <= 0:
+            return False
+    except OSError as exc:
+        raise RuntimeError(
+            f'SQLITE_STORAGE_IO_ERROR: cannot stat database {path}: {type(exc).__name__}: {exc}. '
+            'Do not restore or recreate the database until the storage quota/filesystem is repaired.'
+        ) from exc
     conn = None
     try:
         uri = 'file:' + os.path.abspath(path).replace('\\', '/') + '?mode=ro'
@@ -2173,12 +2183,18 @@ def _sqlite_fast_probe_ok(path: str) -> bool:
         if row is not None:
             conn.execute('SELECT 1 FROM cameras LIMIT 1').fetchone()
         return True
-    except sqlite3.Error as e:
-        log.error('SQLite fast startup probe failed for %s: %s', path, e)
+    except sqlite3.Error as exc:
+        log.error('SQLite fast startup probe failed for %s: %s', path, exc)
+        if _sqlite_environmental_io_error(exc):
+            raise RuntimeError(
+                f'SQLITE_STORAGE_IO_ERROR: SQLite could not read {path} because of a filesystem/storage I/O error '
+                f'({exc}). This is not proof of database corruption. Free/fix storage first; do not create a new DB.'
+            ) from exc
         return False
     finally:
         if conn:
             conn.close()
+
 
 def _sqlite_quick_check_ok(path: str) -> bool:
     """Run SQLite quick_check for an explicit/on-demand diagnostic.
@@ -2190,11 +2206,15 @@ def _sqlite_quick_check_ok(path: str) -> bool:
         return False
     conn = None
     try:
-        conn = sqlite3.connect(path, timeout=5)
+        uri = 'file:' + os.path.abspath(path).replace('\\', '/') + '?mode=ro'
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
         row = conn.execute('PRAGMA quick_check(1)').fetchone()
         return bool(row and str(row[0]).lower() == 'ok')
     except sqlite3.Error as e:
-        log.error('SQLite quick check failed for %s: %s', path, e)
+        if _sqlite_environmental_io_error(e):
+            log.error('SQLite quick check blocked by filesystem/storage I/O for %s: %s', path, e)
+        else:
+            log.error('SQLite quick check failed for %s: %s', path, e)
         return False
     finally:
         if conn:
@@ -2206,11 +2226,15 @@ def _sqlite_integrity_ok(path: str) -> bool:
         return False
     conn = None
     try:
-        conn = sqlite3.connect(path, timeout=10)
+        uri = 'file:' + os.path.abspath(path).replace('\\', '/') + '?mode=ro'
+        conn = sqlite3.connect(uri, uri=True, timeout=10)
         result = conn.execute('PRAGMA integrity_check').fetchall()
         return len(result) == 1 and result[0][0] == 'ok'
     except sqlite3.Error as e:
-        log.error('SQLite integrity check failed for %s: %s', path, e)
+        if _sqlite_environmental_io_error(e):
+            log.error('SQLite integrity check blocked by filesystem/storage I/O for %s: %s', path, e)
+        else:
+            log.error('SQLite integrity check failed for %s: %s', path, e)
         return False
     finally:
         if conn:
@@ -2394,7 +2418,21 @@ def _recover_database_if_needed(allow_create_if_missing: bool = False) -> None:
             mtime = os.path.getmtime(backup)
         except OSError:
             continue
-        if size > 0 and _sqlite_quick_check_ok(backup):
+        if size > 0:
+            try:
+                backup_ok = _sqlite_quick_check_ok(backup)
+            except Exception:
+                raise
+            if not backup_ok:
+                # Disk quota errors can make a healthy backup temporarily unreadable.
+                # Do not label it corrupt based only on an I/O failure.
+                if not _storage_status().get('writable_probe', False):
+                    raise RuntimeError(
+                        'DB PROTECTION STOP: runtime storage is not writable (quota/full filesystem). '
+                        'A backup could not be verified safely. Free storage first, then restart; '
+                        'do not use --create-db-if-missing.'
+                    )
+                continue
             # A quick check is enough to select a candidate without blocking
             # startup. The copied recovery DB is still subjected to the full
             # integrity check below before it replaces the live DB.
