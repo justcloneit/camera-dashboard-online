@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v198.0 — Quota-Safe SQLite Startup Protection
+Camera Dashboard v199.0 — Configurable 200 MiB Upload Limit
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '198.0'
+VERSION = '199.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -677,8 +677,15 @@ app.secret_key = os.getenv('SESSION_SECRET') or os.urandom(24)
 if not os.getenv('SESSION_SECRET'):
     log.warning('SESSION_SECRET is not set; sessions will be invalidated on restart. Set a persistent CAMERA/SESSION secret for production.')
 app.config.update(
-    MAX_CONTENT_LENGTH=max(1 * 1024 * 1024, min(128 * 1024 * 1024,
-        int(os.getenv('CAMERA_MAX_UPLOAD_BYTES', str(64 * 1024 * 1024))))),
+    # Configurable request upload cap: defaults to 200 MiB and is capped at 200 MiB.
+    # Set CAMERA_MAX_UPLOAD_BYTES to a smaller positive byte count to lower the limit.
+    MAX_CONTENT_LENGTH=max(
+        1 * 1024 * 1024,
+        min(
+            200 * 1024 * 1024,
+            int(os.getenv('CAMERA_MAX_UPLOAD_BYTES', str(200 * 1024 * 1024))),
+        ),
+    ),
     MAX_FORM_MEMORY_SIZE=2 * 1024 * 1024,
     SESSION_COOKIE_NAME='camera_dashboard_session',
     SESSION_COOKIE_PATH='/',
