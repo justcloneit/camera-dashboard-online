@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v194.0 — RTSP Credential Recovery
+Camera Dashboard v195.0 — Quota-Safe Runtime Hardening
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -13,6 +13,7 @@ Usage:
 import argparse
 import atexit
 import csv
+import errno
 import copy
 import hashlib
 import hmac
@@ -196,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '194.0'
+VERSION = '195.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -546,6 +547,38 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # LOGGING
 # ══════════════════════════════════════════════════════════════════════════════
 
+class QuotaSafeStreamHandler(logging.StreamHandler):
+    """Console handler that safely degrades if the log sink rejects writes."""
+    def __init__(self, stream=None):
+        super().__init__(stream)
+        self._disabled_after_oserror = False
+        self._warning_emitted = False
+
+    def emit(self, record):
+        if self._disabled_after_oserror:
+            return
+        try:
+            super().emit(record)
+        except OSError as exc:
+            self._disabled_after_oserror = True
+            if not self._warning_emitted:
+                self._warning_emitted = True
+                try:
+                    sys.__stderr__.write(
+                        f'[Logging] Console handler disabled after {type(exc).__name__}: {exc}\\n')
+                    sys.__stderr__.flush()
+                except Exception:
+                    pass
+
+    def handleError(self, record):
+        exc_info = sys.exc_info()
+        exc = exc_info[1] if exc_info else None
+        if isinstance(exc, OSError):
+            self._disabled_after_oserror = True
+            return
+        self._disabled_after_oserror = True
+
+
 class QuotaSafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
     """Disable file logging after a filesystem/quota error without breaking the app.
 
@@ -599,7 +632,7 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)-8s %(name)s %(message)s',
     datefmt='%H:%M:%S',
     handlers=[
-        logging.StreamHandler(),
+        QuotaSafeStreamHandler(),
         QuotaSafeRotatingFileHandler(
             os.path.join(LOG_DIR, 'dashboard.log'),
             maxBytes=5_000_000, backupCount=3, encoding='utf-8'),
@@ -2446,19 +2479,65 @@ def _scan_state_set(**updates):
 def _scan_state_snapshot():
     with _SCAN_STATE_LOCK: return dict(_SCAN_STATE)
 def _storage_status(path=None):
+    """Check host free space and perform a real write probe for quota exhaustion."""
+    target = os.path.abspath(path or DATA_DIR)
+    total = used = free = 0
+    details = []
+    state = 'unknown'
     try:
-        total,used,free=shutil.disk_usage(os.path.abspath(path or DATA_DIR))
-        state='critical' if free<CRITICAL_FREE_BYTES else ('warning' if free<MIN_FREE_BYTES else 'ok')
-        return {'ok':state!='critical','state':state,'total_bytes':total,'used_bytes':used,'free_bytes':free,'free_gb':round(free/1073741824,2),'min_free_bytes':MIN_FREE_BYTES,'critical_free_bytes':CRITICAL_FREE_BYTES}
-    except OSError as exc: return {'ok':False,'state':'unknown','detail':str(exc),'total_bytes':0,'used_bytes':0,'free_bytes':0}
-def _storage_allows_write(extra_bytes=0,operation='database write'):
-    st=_storage_status()
-    if st['state']=='critical':
-        log.critical('[Storage] Refusing %s: %.2f GB free',operation,st.get('free_gb',0)); return False,st
-    if st['free_bytes'] < max(MIN_FREE_BYTES,int(extra_bytes or 0)):
-        log.warning('[Storage] Low disk before %s: %.2f GB free',operation,st.get('free_gb',0)); return False,st
-    if st['state']=='warning': log.warning('[Storage] Warning before %s: %.2f GB free',operation,st.get('free_gb',0))
-    return True,st
+        total, used, free = shutil.disk_usage(target)
+        state = 'critical' if free < CRITICAL_FREE_BYTES else ('warning' if free < MIN_FREE_BYTES else 'ok')
+    except OSError as exc:
+        details.append(f'disk_usage: {type(exc).__name__}: {exc}')
+        state = 'critical'
+
+    writable = False
+    probe_path = None
+    try:
+        os.makedirs(target, exist_ok=True)
+        fd, probe_path = tempfile.mkstemp(prefix='.camera-write-probe-', dir=target)
+        try:
+            os.write(fd, b'camera-dashboard-write-probe\\n')
+            os.fsync(fd)
+            writable = True
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        details.append(f'write_probe: {type(exc).__name__}: {exc}')
+        if exc.errno in (errno.ENOSPC, getattr(errno, 'EDQUOT', -1), errno.EROFS, errno.EACCES, errno.EPERM):
+            state = 'critical'
+    finally:
+        if probe_path:
+            try:
+                os.unlink(probe_path)
+            except OSError as exc:
+                details.append(f'probe_cleanup: {type(exc).__name__}: {exc}')
+
+    if not writable and state == 'ok':
+        state = 'critical'
+    return {
+        'ok': state not in {'critical', 'unknown'} and writable,
+        'state': state, 'total_bytes': total, 'used_bytes': used,
+        'free_bytes': free, 'free_gb': round(free / 1073741824, 2),
+        'min_free_bytes': MIN_FREE_BYTES, 'critical_free_bytes': CRITICAL_FREE_BYTES,
+        'writable_probe': writable, 'detail': '; '.join(details)[:1000]
+    }
+
+
+def _storage_allows_write(extra_bytes=0, operation='database write'):
+    st = _storage_status()
+    if not st['ok']:
+        log.critical('[Storage] Refusing %s: state=%s free=%.2f GB writable_probe=%s detail=%s',
+                     operation, st.get('state'), st.get('free_gb', 0),
+                     st.get('writable_probe'), st.get('detail', ''))
+        return False, st
+    if st['free_bytes'] < max(MIN_FREE_BYTES, int(extra_bytes or 0)):
+        log.warning('[Storage] Low disk before %s: %.2f GB free', operation, st.get('free_gb', 0))
+        return False, st
+    if st['state'] == 'warning':
+        log.warning('[Storage] Warning before %s: %.2f GB free', operation, st.get('free_gb', 0))
+    return True, st
+
 
 _VALIDATION_ACTIVE_LOCK = threading.Lock()
 _VALIDATION_ACTIVE_COUNT = 0
