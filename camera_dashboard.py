@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v195.0 — Quota-Safe Runtime Hardening
+Camera Dashboard v196.0 — Reliable M3U Upload and Import
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '195.0'
+VERSION = '196.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -5101,46 +5101,49 @@ def _parse_m3u_file(path: str) -> list[dict]:
     current_group = os.path.splitext(os.path.basename(path))[0]
     seen_ids: set  = set()
     try:
-        lines = open(path, encoding='utf-8', errors='ignore').readlines()
+        source = open(path, encoding='utf-8-sig', errors='ignore')
     except Exception:
         return cams
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith('#EXTM3U'):
-            continue
-        if line.startswith('#EXTINF'):
-            attrs        = dict(_ATTR_RE.findall(line))
-            current_name = attrs.get('tvg-name') or attrs.get('tvg-id') or ''
-            if not current_name and ',' in line:
-                current_name = line.split(',', 1)[-1].strip()
-            current_group = attrs.get('group-title') or current_group
-            continue
-        if line.startswith('#'):
-            continue
-        if not line.lower().startswith(('rtsp://','rtsps://')):
-            current_name = ''
-            continue
-        cid = _cam_id('', 554, '', line)
-        if cid in seen_ids:
-            current_name = ''
-            continue
-        seen_ids.add(cid)
-        m  = re.search(r'rtsp://[^@]*@?([\d.a-zA-Z.\-]+):(\d+)', line)
-        parsed_host, rtsp_user, rtsp_password, rtsp_port = _rtsp_credentials(line)
-        ip = parsed_host or (m.group(1) if m else '')
-        cams.append({
-            'id': cid, 'ip': ip, 'port': 554,
-            'camera_type': 'M3U Stream',
-            'device_class': 'standalone_stream',
-            'label': current_name.strip() or f'RTSP — {ip or line[:40]}',
-            'rtsp_urls': [line], 'web_url': '',
-            'source_file': path, 'country': current_group.strip(),
-            'city': '', 'region': '', 'username': rtsp_user,
-            'password': rtsp_password, 'rtsp_port': rtsp_port,
-            'group_name': current_group.strip(),
-        })
-        current_name = ''
-    return cams
+    try:
+      for raw_line in source:
+          line = raw_line.strip()
+          if not line or line.startswith('#EXTM3U'):
+              continue
+          if line.startswith('#EXTINF'):
+              attrs        = dict(_ATTR_RE.findall(line))
+              current_name = attrs.get('tvg-name') or attrs.get('tvg-id') or ''
+              if not current_name and ',' in line:
+                  current_name = line.split(',', 1)[-1].strip()
+              current_group = attrs.get('group-title') or current_group
+              continue
+          if line.startswith('#'):
+              continue
+          if not line.lower().startswith(('rtsp://','rtsps://')):
+              current_name = ''
+              continue
+          cid = _cam_id('', 554, '', line)
+          if cid in seen_ids:
+              current_name = ''
+              continue
+          seen_ids.add(cid)
+          m  = re.search(r'rtsp://[^@]*@?([\d.a-zA-Z.\-]+):(\d+)', line)
+          parsed_host, rtsp_user, rtsp_password, rtsp_port = _rtsp_credentials(line)
+          ip = parsed_host or (m.group(1) if m else '')
+          cams.append({
+              'id': cid, 'ip': ip, 'port': 554,
+              'camera_type': 'M3U Stream',
+              'device_class': 'standalone_stream',
+              'label': current_name.strip() or f'RTSP — {ip or line[:40]}',
+              'rtsp_urls': [line], 'web_url': '',
+              'source_file': path, 'country': current_group.strip(),
+              'city': '', 'region': '', 'username': rtsp_user,
+              'password': rtsp_password, 'rtsp_port': rtsp_port,
+              'group_name': current_group.strip(),
+          })
+          current_name = ''
+      return cams
+    finally:
+        source.close()
 
 
 def _parse_json_file(path: str) -> list[dict]:
@@ -12821,38 +12824,109 @@ def add_camera() -> Response:
 
 @app.route('/upload_m3u', methods=['POST'])
 def upload_m3u() -> Response:
-    f = request.files.get('file')
-    if not f:
-        return jsonify({'ok': False, 'detail': 'No file uploaded'})
-    ext  = os.path.splitext(f.filename or 'playlist.m3u')[1].lower()
-    safe = re.sub(r'[^\w.\-]', '_', os.path.basename(f.filename or 'playlist.m3u'))
-    dest = os.path.join(_SEARCH_DIR, safe)
-    f.save(dest)
+    """Upload, parse and persist an M3U/TXT/CSV/XML file with actionable errors.
+
+    All request parsing, disk writes, parsing and DB writes are guarded. A failed
+    request no longer escapes from FileStorage.save() before the error handler.
+    """
+    upload_name = ''
+    temp_path = ''
     try:
+        # Accessing request.files itself can raise BadRequest for malformed multipart
+        # requests, so it must be inside this try block.
+        f = request.files.get('file')
+        if not f or not (f.filename or '').strip():
+            return jsonify({'ok': False, 'detail': 'No file selected. Choose an M3U file and try again.'}), 400
+
+        upload_name = os.path.basename(f.filename or 'playlist.m3u')
+        ext = os.path.splitext(upload_name)[1].lower()
+        if ext not in {'.m3u', '.m3u8', '.txt', '.csv', '.xml'}:
+            return jsonify({
+                'ok': False,
+                'detail': 'Unsupported file type. Upload .m3u, .m3u8, .txt, .csv, or .xml.'
+            }), 400
+
+        safe = re.sub(r'[^\w.\-]', '_', upload_name) or ('playlist' + ext)
+        os.makedirs(_SEARCH_DIR, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix='.upload-', suffix=ext, dir=_SEARCH_DIR)
+        os.close(fd)
+        f.save(temp_path)
+
+        # Parse the temporary upload before replacing any existing source file.
         if ext in ('.m3u', '.m3u8'):
-            cams = _parse_m3u_file(dest)
+            cams = _parse_m3u_file(temp_path)
         elif ext == '.csv':
-            cams = _parse_csv_file(dest)
+            cams = _parse_csv_file(temp_path)
         elif ext == '.xml':
-            cams = _parse_xml_file(dest)
+            cams = _parse_xml_file(temp_path)
         else:
-            # .txt uploads can be plain RTSP lines or ValidCamera blocks.
-            content = Path(dest).read_text(encoding='utf-8', errors='ignore')
+            content = Path(temp_path).read_text(encoding='utf-8-sig', errors='ignore')
             if re.search(r'camera\s+type\s*:|ip\s+address\s*:', content, re.I):
                 cams = []
                 for block in re.split(r'={10,}', content):
-                    cam = _parse_valid_camera_block(block, dest)
+                    cam = _parse_valid_camera_block(block, temp_path)
                     if cam:
                         cams.append(cam)
-                if not cams and 'rtsp://' in content.lower():
-                    cams = _parse_rtsp_file(dest)
+                if not cams and re.search(r'(?i)rtsps?://', content):
+                    cams = _parse_rtsp_file(temp_path)
             else:
-                cams = _parse_rtsp_file(dest)
-        db_bulk_upsert(cams)
-        return jsonify({'ok': True, 'filename': safe, 'count': len(cams),
-                        'queued': len(cams), 'message': 'Imported and queued for validation'})
-    except Exception as e:
-        return jsonify({'ok': False, 'detail': str(e)})
+                cams = _parse_rtsp_file(temp_path)
+
+        if not cams:
+            log.warning('[M3U upload] rejected filename=%s reason=no_supported_records',
+                        safe)
+            return jsonify({
+                'ok': False,
+                'category': 'no_supported_records',
+                'detail': 'The file was received but no supported camera/RTSP records were found. Check that it contains RTSP URLs, one per line, or valid #EXTINF + RTSP entries.'
+            }), 400
+
+        # Persist the stable final source path in each record before upserting.
+        dest = os.path.join(_SEARCH_DIR, safe)
+        for cam in cams:
+            cam['source_file'] = dest
+
+        inserted_or_updated = db_bulk_upsert(cams)
+        # Only publish the uploaded source file after the DB upsert succeeded.
+        os.replace(temp_path, dest)
+        temp_path = ''
+        log.info('[M3U upload] success filename=%s parsed=%d upserted=%d',
+                 safe, len(cams), int(inserted_or_updated or 0))
+        return jsonify({
+            'ok': True, 'filename': safe, 'count': len(cams),
+            'queued': len(cams),
+            'message': f'Imported {len(cams)} camera stream(s). Existing IDs were updated; new IDs were inserted.'
+        }), 200
+
+    except OSError as exc:
+        # ENOSPC/EDQUOT and other filesystem errors are common causes of an
+        # upload appearing to fail with a bare 400 in hosted environments.
+        import errno as _errno
+        if exc.errno in (getattr(_errno, 'ENOSPC', 28),
+                         getattr(_errno, 'EDQUOT', 122)):
+            detail = 'Upload could not be saved because the project storage quota is full. Free storage and retry.'
+            log.error('[M3U upload] storage quota failure filename=%s errno=%s',
+                      upload_name, exc.errno)
+            return jsonify({'ok': False, 'category': 'storage_quota', 'detail': detail}), 507
+        log.exception('[M3U upload] filesystem failure filename=%s', upload_name)
+        return jsonify({
+            'ok': False, 'category': 'filesystem_error',
+            'detail': f'Could not save/read the upload ({type(exc).__name__}). Check the project data directory and permissions.'
+        }), 500
+    except Exception as exc:
+        # Avoid returning exception text that could contain RTSP credentials.
+        log.exception('[M3U upload] failed filename=%s error_type=%s',
+                      upload_name, type(exc).__name__)
+        return jsonify({
+            'ok': False, 'category': 'import_failed',
+            'detail': f'Import failed ({type(exc).__name__}). The server log contains the diagnostic; the uploaded file was not reported as imported.'
+        }), 500
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 @app.route('/snapshot/<cam_id>')
