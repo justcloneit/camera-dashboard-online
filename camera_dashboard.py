@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v193.0 — FFmpeg Startup Timeout Fix
+Camera Dashboard v194.0 — RTSP Credential Recovery
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -196,7 +196,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '193.0'
+VERSION = '194.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -6485,6 +6485,38 @@ def _stream_urls_for_camera(cam_id: str) -> list[str]:
     cam = db_get_camera(cam_id)
     urls = [u for u in (cam or {}).get('rtsp_urls', [])
             if isinstance(u, str) and u.lower().startswith(('rtsp://','rtsps://'))]
+
+    # Recover credentials from DB columns for imported URLs that omitted them.
+    # Never guess a password and never modify the stored URL/database record.
+    username = str((cam or {}).get('username') or '').strip()
+    password = str((cam or {}).get('password') or '')
+    if password:
+        repaired = []
+        for url in urls:
+            try:
+                parts = urlsplit(url)
+                if parts.scheme.lower() not in {'rtsp', 'rtsps'} or parts.password:
+                    repaired.append(url)
+                    continue
+                user = unquote(parts.username or '') or username
+                if not user:
+                    repaired.append(url)
+                    continue
+                host = parts.hostname or ''
+                if ':' in host and not host.startswith('['):
+                    host = f'[{host}]'
+                port = f':{parts.port}' if parts.port else ''
+                auth = f'{quote(user, safe="")}:{quote(password, safe="")}@'
+                rebuilt = f'{parts.scheme}://{auth}{host}{port}{parts.path or ""}'
+                if parts.query:
+                    rebuilt += '?' + parts.query
+                if parts.fragment:
+                    rebuilt += '#' + parts.fragment
+                repaired.append(rebuilt)
+            except (TypeError, ValueError):
+                repaired.append(url)
+        urls = repaired
+
     return [item[2] for item in sorted(
         ((-_score_rtsp_candidate(cam or {}, url, pos), pos, url)
          for pos, url in enumerate(urls)),
@@ -13434,8 +13466,16 @@ def stream_mjpeg(cam_id: str) -> Response:
                             return
                         detail = _ffmpeg_diagnostic(proc, stderr_lines)
                         diagnostics.append(f'{transport} {detail}')
-                        _stream_log('[HTTP stream] NO_FRAMES camera=%s transport=%s detail=%s url=%s',
-                                    cam_id, transport, detail, rtsp_url)
+                        if '401 unauthorized' in detail.lower() or 'authorization failed' in detail.lower():
+                            category = 'AUTH_REJECTED: check stored username/password'
+                        elif 'connection refused' in detail.lower():
+                            category = 'PORT_REFUSED: check RTSP service/port/firewall'
+                        elif 'timed out' in detail.lower() or 'timeout' in detail.lower():
+                            category = 'NETWORK_TIMEOUT: check reachability/routing/firewall'
+                        else:
+                            category = 'STREAM_OPEN_FAILED'
+                        _stream_log('[HTTP stream] NO_FRAMES camera=%s transport=%s category=%s detail=%s url=%s',
+                                    cam_id, transport, category, detail, rtsp_url)
                     except GeneratorExit:
                         raise
                     except Exception as exc:
