@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v201.0 — Graceful Shutdown and Upload Limit Fix
+Camera Dashboard v202.0 — Geographic Category Titles
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '201.0'
+VERSION = '202.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -4587,31 +4587,54 @@ def _db_get_group_stats_uncached() -> list[dict]:
         d=dict(r)
         for k,v in d.items():
             if isinstance(v,str): d[k]=_safe_str(v)
-        # Replace placeholder category prefixes such as "XX - Hikvision - IP:port"
-        # with the best saved geographic label while preserving the original group key.
-        raw_group = _safe_str(d.get('display_group') or '')
-        location_parts = [d.get(k) for k in ('area', 'city', 'region', 'country')]
-        location_parts = list(dict.fromkeys(_safe_str(x).strip() for x in location_parts if _safe_str(x).strip()))
-        location_label = ', '.join(location_parts)
-        # Replace generic category labels in the visible heading with a grounded
-        # vendor label when known, otherwise a neutral RTSP-device label. Keep the
-        # original display_group untouched because it is the database filter key.
-        group_title = raw_group
+        # Build a human-friendly category heading from the saved device vendor and
+        # geolocation fields. Keep display_group/group_key unchanged for filtering.
+        raw_group = _safe_str(d.get('display_group') or '').strip()
         camera_type = _safe_str(d.get('camera_type') or '').strip()
-        vendor = camera_type if camera_type.lower() not in {
+        known_vendors = (
+            'Hikvision', 'Dahua', 'Uniview', 'UNV', 'Axis', 'Hanwha',
+            'Tiandy', 'Vivotek', 'Bosch', 'Reolink', 'TP-Link', 'Foscam'
+        )
+        vendor = ''
+        if camera_type and camera_type.lower() not in {
             'generic', 'generic_rtsp', 'generic_rtsp_pending', 'unknown',
             'vendor_unsupported', 'camera', 'rtsp'
-        } else 'RTSP Device'
-        if re.search(r'\bgeneric(?:_rtsp(?:_pending)?)?\b', group_title, re.I):
-            group_title = re.sub(r'generic(?:_rtsp(?:_pending)?)?', vendor, group_title, flags=re.I)
-        if re.match(r'^XX(?:\s|[-_:·]|$)', group_title, re.I) and location_label:
-            group_title = location_label + re.sub(r'^XX', '', group_title, count=1, flags=re.I)
-        # Add an endpoint when a legacy category title contains no useful identity.
-        if not group_title or group_title.lower() in {'generic', 'unknown', 'camera'}:
-            endpoint_ip = _safe_str(d.get('sample_ip') or '').strip()
-            endpoint_port = d.get('sample_port')
-            group_title = f'{vendor} · {endpoint_ip}' + (f':{endpoint_port}' if endpoint_port else '') if endpoint_ip else (location_label or vendor)
-        d['display_title'] = group_title or location_label or 'Unknown location'
+        }:
+            vendor = camera_type
+        else:
+            for candidate in known_vendors:
+                if re.search(r'(?<![A-Za-z0-9])' + re.escape(candidate) + r'(?![A-Za-z0-9])', raw_group, re.I):
+                    vendor = candidate
+                    break
+        if not vendor:
+            vendor = 'RTSP Device'
+
+        # Lookup Location writes these fields to the camera rows; aggregate stats
+        # above pick a non-empty saved value for each field in the category.
+        location_parts = []
+        for key in ('area', 'city', 'region', 'country'):
+            value = _safe_str(d.get(key) or '').strip()
+            if not value or value.lower() in {'unknown', 'n/a', 'none', 'null'}:
+                continue
+            if value.casefold() not in {part.casefold() for part in location_parts}:
+                location_parts.append(value)
+        location_label = ', '.join(location_parts)
+
+        if location_label:
+            d['display_title'] = f'{vendor} · {location_label}'
+        else:
+            # Without saved geolocation, retain the existing useful group title;
+            # replace generic placeholders but do not fabricate a location.
+            group_title = raw_group
+            if re.search(r'\bgeneric(?:_rtsp(?:_pending)?)?\b', group_title, re.I):
+                group_title = re.sub(r'generic(?:_rtsp(?:_pending)?)?', vendor, group_title, flags=re.I)
+            if re.match(r'^XX(?:\s|[-_:·]|$)', group_title, re.I):
+                group_title = re.sub(r'^XX(?:\s*[-_:·]?\s*)?', vendor + ' · ', group_title, count=1, flags=re.I)
+            if not group_title or group_title.lower() in {'generic', 'unknown', 'camera'}:
+                endpoint_ip = _safe_str(d.get('sample_ip') or '').strip()
+                endpoint_port = d.get('sample_port')
+                group_title = f'{vendor} · {endpoint_ip}' + (f':{endpoint_port}' if endpoint_port else '') if endpoint_ip else vendor
+            d['display_title'] = group_title
         out.append(d)
     return out
 
