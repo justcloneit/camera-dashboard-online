@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v199.0 — Configurable 200 MiB Upload Limit
+Camera Dashboard v201.0 — Graceful Shutdown and Upload Limit Fix
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '199.0'
+VERSION = '201.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -2094,8 +2094,13 @@ def _graceful_shutdown(reason='user') -> bool:
     _shutdown_requested.wait(0.15)
     ok = _flush_database_for_shutdown()
     if ok:
-        _write_clean_shutdown_marker()
-        log.info('[Shutdown] Graceful shutdown DB flush complete; clean marker written; periodic verified backup remains the recovery copy.')
+        marker_ok = _write_clean_shutdown_marker()
+        if marker_ok:
+            log.info('[Shutdown] Graceful shutdown DB flush complete; clean marker written; periodic verified backup remains the recovery copy.')
+        else:
+            # The DB barrier succeeded, but a marker write failure must not be
+            # reported as if the marker existed. Startup can run normal checks.
+            log.warning('[Shutdown] Database flush completed, but clean marker could not be written; startup integrity checks will run normally.')
     else:
         _remove_clean_shutdown_marker()
         log.error('[Shutdown] Graceful shutdown DB flush completed with errors; clean marker NOT written.')
@@ -2845,6 +2850,12 @@ def _db_retry_write(fn, label='database write'):
         except sqlite3.OperationalError as exc:
             last = exc
             msg = str(exc).lower()
+            # Background writes are intentionally cancellable at shutdown. Treat
+            # cancellation as a normal lifecycle outcome, not a failed DB write.
+            if (_shutdown_requested.is_set() and _db_is_background_label(label)
+                    and ('cancelled during shutdown' in msg or 'shutdown requested' in msg)):
+                log.debug('[SQLite] %s stopped cooperatively during shutdown', label)
+                return None
             if any(token in msg for token in ('disk is full', 'database or disk is full', 'disk quota exceeded', 'no space left')):
                 log.critical('[Storage] SQLite write failed because storage is full/quota-exhausted; operation=%s error=%s',
                              label, type(exc).__name__)
@@ -14718,7 +14729,10 @@ def _v40_health_supervisor():
                 log.warning('[SQLite] health supervisor deferred a locked write; it will retry on the next health cycle')
             else:
                 log.exception('v40 health supervisor error')
-        except Exception:
+        except Exception as exc:
+            if _shutdown_requested.is_set():
+                log.debug('v40 health supervisor exiting during shutdown: %s', exc)
+                return
             log.exception('v40 health supervisor error')
         _shutdown_requested.wait(max(15,ADVANCED_HEALTH_INTERVAL))
 
