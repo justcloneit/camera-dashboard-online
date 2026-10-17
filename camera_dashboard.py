@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v202.0 — Geographic Category Titles
+Camera Dashboard v203.0 — Full Device and Location Category Titles
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '202.0'
+VERSION = '203.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -4574,7 +4574,7 @@ def _db_get_group_stats_uncached() -> list[dict]:
         SELECT COALESCE(NULLIF(c.group_name,''), NULLIF(c.country,''), 'Unknown') AS display_group,
                MAX(NULLIF(c.area,'')) AS area, MAX(NULLIF(c.city,'')) AS city,
                MAX(NULLIF(c.region,'')) AS region, MAX(NULLIF(c.country,'')) AS country,
-               MAX(NULLIF(c.camera_type,'')) AS camera_type, MAX(NULLIF(c.ip,'')) AS sample_ip,
+               MAX(NULLIF(c.camera_type,'')) AS camera_type, MAX(NULLIF(c.label,'')) AS sample_label, MAX(NULLIF(c.ip,'')) AS sample_ip,
                MAX(c.port) AS sample_port,
                COUNT(*) AS total, SUM(c.status='online') AS online, SUM(c.status='offline') AS offline,
                SUM(c.status='checking') AS checking, SUM(c.status='unknown') AS unknown,
@@ -4587,54 +4587,58 @@ def _db_get_group_stats_uncached() -> list[dict]:
         d=dict(r)
         for k,v in d.items():
             if isinstance(v,str): d[k]=_safe_str(v)
-        # Build a human-friendly category heading from the saved device vendor and
-        # geolocation fields. Keep display_group/group_key unchanged for filtering.
+        # Category headings are display-only: preserve display_group/group_key for
+        # filtering, while showing country, area, city, vendor, and IP:port.
         raw_group = _safe_str(d.get('display_group') or '').strip()
         camera_type = _safe_str(d.get('camera_type') or '').strip()
+        sample_label = _safe_str(d.get('sample_label') or '').strip()
         known_vendors = (
-            'Hikvision', 'Dahua', 'Uniview', 'UNV', 'Axis', 'Hanwha',
-            'Tiandy', 'Vivotek', 'Bosch', 'Reolink', 'TP-Link', 'Foscam'
+            ('Hikvision', ('hikvision', 'hik')),
+            ('Dahua', ('dahua', 'anjhua')),
+            ('Uniview', ('uniview', 'unv')),
+            ('Axis', ('axis',)), ('Hanwha', ('hanwha', 'wisenet')),
+            ('Tiandy', ('tiandy',)), ('Vivotek', ('vivotek',)),
+            ('Bosch', ('bosch',)), ('Reolink', ('reolink',)),
+            ('TP-Link', ('tp-link', 'tplink')), ('Foscam', ('foscam',)),
+            ('Amcrest', ('amcrest',)),
         )
         vendor = ''
-        if camera_type and camera_type.lower() not in {
+        for candidate, needles in known_vendors:
+            if any(re.search(r'(?<![A-Za-z0-9])' + re.escape(n) + r'(?![A-Za-z0-9])', value, re.I)
+                   for value in (camera_type, sample_label, raw_group) for n in needles):
+                vendor = candidate
+                break
+        if not vendor and camera_type and camera_type.lower() not in {
             'generic', 'generic_rtsp', 'generic_rtsp_pending', 'unknown',
             'vendor_unsupported', 'camera', 'rtsp'
         }:
             vendor = camera_type
-        else:
-            for candidate in known_vendors:
-                if re.search(r'(?<![A-Za-z0-9])' + re.escape(candidate) + r'(?![A-Za-z0-9])', raw_group, re.I):
-                    vendor = candidate
-                    break
         if not vendor:
             vendor = 'RTSP Device'
 
-        # Lookup Location writes these fields to the camera rows; aggregate stats
-        # above pick a non-empty saved value for each field in the category.
+        # Add location parts in the requested order. Drop blanks and duplicate
+        # values (e.g. when area and city are both recorded as Sholapur).
         location_parts = []
-        for key in ('area', 'city', 'region', 'country'):
+        for key in ('country', 'area', 'city'):
             value = _safe_str(d.get(key) or '').strip()
             if not value or value.lower() in {'unknown', 'n/a', 'none', 'null'}:
                 continue
             if value.casefold() not in {part.casefold() for part in location_parts}:
                 location_parts.append(value)
-        location_label = ', '.join(location_parts)
+        endpoint_ip = _safe_str(d.get('sample_ip') or '').strip()
+        endpoint_port = d.get('sample_port')
+        endpoint = f'{endpoint_ip}:{endpoint_port}' if endpoint_ip and endpoint_port else endpoint_ip
 
-        if location_label:
-            d['display_title'] = f'{vendor} · {location_label}'
-        else:
-            # Without saved geolocation, retain the existing useful group title;
-            # replace generic placeholders but do not fabricate a location.
-            group_title = raw_group
-            if re.search(r'\bgeneric(?:_rtsp(?:_pending)?)?\b', group_title, re.I):
-                group_title = re.sub(r'generic(?:_rtsp(?:_pending)?)?', vendor, group_title, flags=re.I)
-            if re.match(r'^XX(?:\s|[-_:·]|$)', group_title, re.I):
-                group_title = re.sub(r'^XX(?:\s*[-_:·]?\s*)?', vendor + ' · ', group_title, count=1, flags=re.I)
-            if not group_title or group_title.lower() in {'generic', 'unknown', 'camera'}:
-                endpoint_ip = _safe_str(d.get('sample_ip') or '').strip()
-                endpoint_port = d.get('sample_port')
-                group_title = f'{vendor} · {endpoint_ip}' + (f':{endpoint_port}' if endpoint_port else '') if endpoint_ip else vendor
-            d['display_title'] = group_title
+        # Include region/state only when no area/city has been saved, so the
+        # requested country · area · city order remains easy to scan.
+        if not any(key in d and _safe_str(d.get(key) or '').strip() for key in ('area', 'city')):
+            region = _safe_str(d.get('region') or '').strip()
+            if region and region.casefold() not in {part.casefold() for part in location_parts}:
+                location_parts.insert(1 if location_parts else 0, region)
+        title_parts = location_parts + [vendor]
+        if endpoint:
+            title_parts.append(endpoint)
+        d['display_title'] = ' · '.join(title_parts)
         out.append(d)
     return out
 
