@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v208.0 — Responsive Rendering and Channel Order
+Camera Dashboard v209.0 — Recheck Error Handling
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '208.0'
+VERSION = '209.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -8030,15 +8030,33 @@ async function refreshAll() {
 }
 
 async function recheckFiles() {
-  const btn = [...document.querySelectorAll('header .btn')].find(b => b.textContent.includes('Recheck'));
+  const btn = [...document.querySelectorAll('header .btn')].find(b => /recheck/i.test(b.textContent));
+  const originalLabel = '🔎 Recheck';
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Rechecking…'; }
   try {
-    const d = await fetch('/api/recheck', {method:'POST'}).then(r => r.json());
-    showToast(d.ok ? '🔎 All .m3u/.m3u8/.txt files queued for recheck' : '❌ ' + d.detail, !d.ok);
-    setTimeout(() => location.reload(), 1800);
+    const response = await fetch('/api/recheck', {
+      method: 'POST',
+      headers: {'Accept': 'application/json'}
+    });
+    let d = {};
+    try { d = await response.json(); }
+    catch (_) { throw new Error('Server returned a non-JSON response (HTTP ' + response.status + '). Check dashboard.log.'); }
+
+    if (!response.ok || !d.ok) {
+      const message = d.message || d.detail || d.error ||
+        ('Request failed with HTTP ' + response.status);
+      showToast('❌ Recheck not started: ' + message, true);
+      if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+      return;
+    }
+
+    showToast('🔎 ' + (d.message || 'Camera files queued for recheck.'), false);
+    // The endpoint starts a background scan. Do not reload immediately; that can
+    // interrupt the user's view and hide the server's actual result.
+    if (btn) btn.title = 'Recheck accepted. Watch dashboard.log for scan progress.';
   } catch(e) {
-    showToast('❌ Recheck failed: ' + e.message, true);
-    if (btn) { btn.disabled = false; btn.textContent = '🔎 Recheck'; }
+    showToast('❌ Recheck failed: ' + (e && e.message ? e.message : String(e)), true);
+    if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
   }
 }
 
