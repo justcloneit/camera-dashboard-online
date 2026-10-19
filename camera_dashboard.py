@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v205.0 — Responsive Rendering and Channel Order
+Camera Dashboard v206.0 — Responsive Rendering and Channel Order
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '205.0'
+VERSION = '206.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -4689,15 +4689,18 @@ def db_get_cameras_by_group(display_group: str, limit: int = PAGE_SIZE,
         where = "COALESCE(NULLIF(c.group_name,''),NULLIF(c.country,''),'Unknown')=?"; params=[display_group]
     if _auth_enabled() and _current_role() != 'admin':
         user=_current_user()
-        where += ''' AND (
-            NOT EXISTS (SELECT 1 FROM v43_user_access_scope sx WHERE sx.username=?)
-            OR EXISTS (
-                SELECT 1 FROM v43_user_access_scope s WHERE s.username=? AND
-                ((s.scope_type='camera' AND s.scope_value=c.id) OR
-                 (s.scope_type='country' AND lower(s.scope_value)=lower(c.country)) OR
-                 (s.scope_type='device' AND (lower(s.scope_value)=lower(c.device_id) OR lower(s.scope_value)=lower(c.ip))))
-            )
-        )'''
+        where += (
+            " AND ("
+            " NOT EXISTS (SELECT 1 FROM v43_user_access_scope sx WHERE sx.username=?)"
+            " OR EXISTS ("
+            " SELECT 1 FROM v43_user_access_scope s WHERE s.username=? AND ("
+            " (s.scope_type='camera' AND s.scope_value=c.id)"
+            " OR (s.scope_type='country' AND lower(s.scope_value)=lower(c.country))"
+            " OR (s.scope_type='device' AND (lower(s.scope_value)=lower(c.device_id) OR lower(s.scope_value)=lower(c.ip)))"
+            " )"
+            " )"
+            " )"
+        )
         params.extend([user,user])
     rows=_db_conn().execute(
         f'SELECT c.* FROM cameras c WHERE c.deleted=0 AND {where} '
@@ -4717,15 +4720,18 @@ def db_get_group_count(display_group: str) -> int:
         where="COALESCE(NULLIF(c.group_name,''),NULLIF(c.country,''),'Unknown')=?"; params=[display_group]
     if _auth_enabled() and _current_role() != 'admin':
         user=_current_user()
-        where += ''' AND (
-            NOT EXISTS (SELECT 1 FROM v43_user_access_scope sx WHERE sx.username=?)
-            OR EXISTS (
-                SELECT 1 FROM v43_user_access_scope s WHERE s.username=? AND
-                ((s.scope_type='camera' AND s.scope_value=c.id) OR
-                 (s.scope_type='country' AND lower(s.scope_value)=lower(c.country)) OR
-                 (s.scope_type='device' AND (lower(s.scope_value)=lower(c.device_id) OR lower(s.scope_value)=lower(c.ip))))
-            )
-        )'''
+        where += (
+            " AND ("
+            " NOT EXISTS (SELECT 1 FROM v43_user_access_scope sx WHERE sx.username=?)"
+            " OR EXISTS ("
+            " SELECT 1 FROM v43_user_access_scope s WHERE s.username=? AND ("
+            " (s.scope_type='camera' AND s.scope_value=c.id)"
+            " OR (s.scope_type='country' AND lower(s.scope_value)=lower(c.country))"
+            " OR (s.scope_type='device' AND (lower(s.scope_value)=lower(c.device_id) OR lower(s.scope_value)=lower(c.ip)))"
+            " )"
+            " )"
+            " )"
+        )
         params.extend([user,user])
     row=c.execute(f'SELECT COUNT(*) FROM cameras c WHERE c.deleted=0 AND {where}',params).fetchone()
     return int(row[0] or 0) if row else 0
