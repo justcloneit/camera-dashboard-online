@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v203.0 — Full Device and Location Category Titles
+Camera Dashboard v204.0 — Recheck Error Message Fix
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '203.0'
+VERSION = '204.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -8023,14 +8023,22 @@ async function refreshAll() {
 
 async function recheckFiles() {
   const btn = [...document.querySelectorAll('header .btn')].find(b => b.textContent.includes('Recheck'));
+  const originalLabel = '🔎 Recheck';
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Rechecking…'; }
   try {
-    const d = await fetch('/api/recheck', {method:'POST'}).then(r => r.json());
-    showToast(d.ok ? '🔎 All .m3u/.m3u8/.txt files queued for recheck' : '❌ ' + d.detail, !d.ok);
+    const response = await fetch('/api/recheck', {method:'POST', headers:{'Accept':'application/json'}});
+    let d = {};
+    try { d = await response.json(); } catch (_) { d = {}; }
+    if (!response.ok || d.ok === false) {
+      const detail = d.detail || d.message || d.error || `Request failed (HTTP ${response.status})`;
+      throw new Error(String(detail || 'Recheck could not be started'));
+    }
+    showToast('🔎 ' + (d.message || d.detail || 'All supported camera files queued for recheck'));
     setTimeout(() => location.reload(), 1800);
   } catch(e) {
-    showToast('❌ Recheck failed: ' + e.message, true);
-    if (btn) { btn.disabled = false; btn.textContent = '🔎 Recheck'; }
+    const message = (e && e.message) ? e.message : 'Unknown error while starting recheck';
+    showToast('❌ Recheck failed: ' + message, true);
+    if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
   }
 }
 
