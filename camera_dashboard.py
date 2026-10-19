@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v206.0 — Responsive Rendering and Channel Order
+Camera Dashboard v207.0 — Responsive Rendering and Channel Order
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '206.0'
+VERSION = '207.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -4704,7 +4704,7 @@ def db_get_cameras_by_group(display_group: str, limit: int = PAGE_SIZE,
         params.extend([user,user])
     rows=_db_conn().execute(
         f'SELECT c.* FROM cameras c WHERE c.deleted=0 AND {where} '
-        f'ORDER BY CASE WHEN COALESCE(c.device_id,'')<>'' THEN c.device_id ELSE c.ip END COLLATE NOCASE, c.ip, c.port, CASE WHEN c.channel_index>0 THEN 0 ELSE 1 END, c.channel_index, c.id LIMIT ? OFFSET ?',
+        f"ORDER BY CASE WHEN COALESCE(c.device_id,'')<>'' THEN c.device_id ELSE c.ip END COLLATE NOCASE, c.ip, c.port, CASE WHEN c.channel_index>0 THEN 0 ELSE 1 END, c.channel_index, c.id LIMIT ? OFFSET ?",
         params+[max(1,int(limit)),max(0,int(offset))]).fetchall()
     result = [_db_row(r) for r in rows]
     for cam in result:
