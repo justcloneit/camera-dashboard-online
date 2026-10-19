@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v207.0 — Responsive Rendering and Channel Order
+Camera Dashboard v208.0 — Responsive Rendering and Channel Order
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '207.0'
+VERSION = '208.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -7380,8 +7380,9 @@ dialog h2{margin-bottom:14px;font-size:16px;color:var(--accent)}
   <h2>📂 Import Playlist</h2>
   <form onsubmit="submitM3u(event)">
     <div class="field"><label>File (.m3u, .m3u8, .txt, .csv) *</label>
-      <input id="m3u-file" type="file" accept=".m3u,.m3u8,.txt,.csv,.xml" required
-             style="padding:5px 0;background:transparent;border:none;color:var(--text)"></div>
+      <input id="m3u-file" type="file" accept=".m3u,.m3u8,.txt,.csv,.xml,.json" multiple required
+             style="padding:5px 0;background:transparent;border:none;color:var(--text)">
+      <small style="display:block;color:var(--muted);margin-top:5px">Select one or more playlist/inventory files. Each selected file is imported once when you press Import.</small></div>
     <p style="font-size:11px;color:var(--muted);margin-bottom:8px">Only rtsp:// entries are imported.</p>
     <div id="m3u-progress"></div>
     <div class="modal-actions">
@@ -8947,43 +8948,62 @@ function submitAddCamera(e) {
     });
 }
 
-function submitM3u(e) {
+async function submitM3u(e) {
   e.preventDefault();
-  const file = document.getElementById('m3u-file').files[0]; if (!file) return;
-  const prog   = document.getElementById('m3u-progress');
+  const input = document.getElementById('m3u-file');
+  const files = Array.from(input.files || []);
+  if (!files.length) return;
+  const prog = document.getElementById('m3u-progress');
   const submit = document.getElementById('m3u-submit');
-  prog.textContent = '⏳ Uploading…'; prog.style.display = ''; submit.disabled = true;
-  const fd = new FormData(); fd.append('file', file);
-  fetch('/upload_m3u', {method:'POST', body: fd})
-    .then(async r => {
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok || !d.ok) throw Error(d.detail || ('Upload failed (HTTP ' + r.status + ')'));
-      if (!d.job_id) throw Error(d.detail || 'Server did not create an import job');
-      prog.textContent = '✅ Upload received. Importing…'; submit.disabled = true;
-      const poll = async () => {
-        try {
-          const r2 = await fetch('/api/import/status/' + encodeURIComponent(d.job_id), {cache:'no-store'});
-          const s = await r2.json();
-          if (!r2.ok || !s.ok) throw Error(s.detail || 'Import status unavailable');
-          prog.textContent = (s.status === 'completed' ? '✅ ' : s.status === 'failed' ? '❌ ' : '⏳ ')
-            + (s.message || s.status) + (s.parsed ? ' · parsed ' + s.parsed : '')
-            + (s.upserted ? ' · saved ' + s.upserted : '');
-          if (s.status === 'completed') {
-            document.getElementById('m3u-modal').close();
-            showToast('✅ ' + s.filename + ' — ' + s.upserted + ' records imported — reloading…');
-            setTimeout(() => location.reload(), 1400); return;
-          }
-          if (s.status === 'failed') { submit.disabled = false; return; }
-          setTimeout(poll, 1200);
-        } catch (err) {
-          prog.textContent = '❌ Import status error: ' + err.message;
-          submit.disabled = false;
-        }
-      };
-      setTimeout(poll, 500);
-    }).catch(err => { prog.textContent = '❌ ' + err.message; submit.disabled = false; });
-}
+  const allowed = /\.(m3u8?|txt|csv|xml|json)$/i;
+  const invalid = files.find(f => !allowed.test(f.name));
+  if (invalid) {
+    prog.textContent = '❌ Unsupported file type: ' + invalid.name;
+    prog.style.display = '';
+    return;
+  }
+  submit.disabled = true;
+  const results = [];
+  prog.style.display = '';
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+  async function importOne(file, index) {
+    prog.textContent = `⏳ Uploading file ${index + 1}/${files.length}: ${file.name}`;
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+    const response = await fetch('/upload_m3u', {method:'POST', body:fd});
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok || !data.job_id) {
+      throw Error(data.detail || `${file.name}: upload failed (HTTP ${response.status})`);
+    }
+    while (true) {
+      await wait(1000);
+      const statusResponse = await fetch('/api/import/status/' + encodeURIComponent(data.job_id), {cache:'no-store'});
+      const status = await statusResponse.json().catch(() => ({}));
+      if (!statusResponse.ok || !status.ok) throw Error(status.detail || `${file.name}: import status unavailable`);
+      prog.textContent = `⏳ File ${index + 1}/${files.length}: ${file.name} — `
+        + (status.message || status.status)
+        + (status.parsed ? ` · parsed ${status.parsed}` : '')
+        + (status.upserted ? ` · saved ${status.upserted}` : '');
+      if (status.status === 'completed') {
+        results.push({name:file.name, count:Number(status.upserted || 0)});
+        return;
+      }
+      if (status.status === 'failed') throw Error(`${file.name}: ${status.message || 'import failed'}`);
+    }
+  }
+  try {
+    // Sequential uploads avoid flooding SQLite with concurrent import jobs.
+    for (let i=0; i<files.length; i++) await importOne(files[i], i);
+    const total = results.reduce((sum, item) => sum + item.count, 0);
+    prog.textContent = `✅ Imported ${results.length} file(s); ${total} camera records acknowledged. Reloading…`;
+    showToast(`✅ Imported ${results.length} file(s) — ${total} records — reloading…`);
+    setTimeout(() => location.reload(), 1400);
+  } catch (err) {
+    prog.textContent = '❌ ' + err.message + (results.length ? ` (completed ${results.length}/${files.length} files; successful files were kept)` : '');
+    submit.disabled = false;
+  }
+}
 async function previewM3u() {
   const file = document.getElementById('m3u-file').files[0];
   const prog = document.getElementById('m3u-progress');
@@ -13023,6 +13043,8 @@ def _m3u_import_job(job_id: str, temp_path: str, dest: str,
             cams = _parse_csv_file(temp_path)
         elif ext == '.xml':
             cams = _parse_xml_file(temp_path)
+        elif ext == '.json':
+            cams = _parse_json_file(temp_path)
         else:
             # Stream TXT lines for RTSP playlists; only use whole-file parsing
             # for structured camera inventory blocks.
@@ -13117,8 +13139,8 @@ def upload_m3u() -> Response:
 
         upload_name = os.path.basename(f.filename or 'playlist.m3u')
         ext = os.path.splitext(upload_name)[1].lower()
-        if ext not in {'.m3u', '.m3u8', '.txt', '.csv', '.xml'}:
-            return jsonify({'ok': False, 'detail': 'Unsupported file type. Upload .m3u, .m3u8, .txt, .csv, or .xml.'}), 400
+        if ext not in {'.m3u', '.m3u8', '.txt', '.csv', '.xml', '.json'}:
+            return jsonify({'ok': False, 'detail': 'Unsupported file type. Upload .m3u, .m3u8, .txt, .csv, .xml, or .json.'}), 400
 
         safe_name = re.sub(r'[^\w.\-]', '_', upload_name) or ('playlist' + ext)
         os.makedirs(_SEARCH_DIR, exist_ok=True)
