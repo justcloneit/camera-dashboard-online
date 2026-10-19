@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v204.0 — Recheck Error Message Fix
+Camera Dashboard v205.0 — Responsive Rendering and Channel Order
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '204.0'
+VERSION = '205.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -323,7 +323,7 @@ RTSP_SAVE     = os.path.join(DATA_DIR, 'generated_rtsp_links.txt')
 MIN_FREE_BYTES = max(64*1024*1024, int(os.getenv('CAMERA_MIN_FREE_BYTES', str(512*1024*1024))))
 CRITICAL_FREE_BYTES = max(32*1024*1024, int(os.getenv('CAMERA_CRITICAL_FREE_BYTES', str(256*1024*1024))))
 SCAN_BATCH_SIZE = max(100, min(5000, int(os.getenv('CAMERA_SCAN_BATCH_SIZE', '500'))))
-PAGE_SIZE     = 200
+PAGE_SIZE     = 60
 MAX_STREAMS   = max(1, min(256, int(os.getenv('CAMERA_MAX_LIVE_STREAMS', '36'))))
 # User-tunable capacity. These are deliberately independent: validation can
 # process a large inventory while live viewing remains bounded by stream/CPU
@@ -4701,7 +4701,7 @@ def db_get_cameras_by_group(display_group: str, limit: int = PAGE_SIZE,
         params.extend([user,user])
     rows=_db_conn().execute(
         f'SELECT c.* FROM cameras c WHERE c.deleted=0 AND {where} '
-        f'ORDER BY {_STATUS_SORT.replace("status","c.status")}, COALESCE(c.last_seen,"") DESC, c.ip LIMIT ? OFFSET ?',
+        f'ORDER BY CASE WHEN COALESCE(c.device_id,'')<>'' THEN c.device_id ELSE c.ip END COLLATE NOCASE, c.ip, c.port, CASE WHEN c.channel_index>0 THEN 0 ELSE 1 END, c.channel_index, c.id LIMIT ? OFFSET ?',
         params+[max(1,int(limit)),max(0,int(offset))]).fetchall()
     result = [_db_row(r) for r in rows]
     for cam in result:
@@ -7002,7 +7002,8 @@ main{padding:10px 14px;max-width:1800px;margin:0 auto}
 
 /* ── Camera card ── */
 .cam-card{background:var(--card);border:1px solid var(--border);border-radius:10px;
-  overflow:hidden;transition:border-color .2s;display:flex;flex-direction:column}
+  overflow:hidden;transition:border-color .2s;display:flex;flex-direction:column;
+  content-visibility:auto;contain-intrinsic-size:360px 430px;contain:layout style}
 .cam-card:hover{border-color:var(--accent)}
 .cam-card.hidden{display:none}
 
@@ -8023,22 +8024,14 @@ async function refreshAll() {
 
 async function recheckFiles() {
   const btn = [...document.querySelectorAll('header .btn')].find(b => b.textContent.includes('Recheck'));
-  const originalLabel = '🔎 Recheck';
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Rechecking…'; }
   try {
-    const response = await fetch('/api/recheck', {method:'POST', headers:{'Accept':'application/json'}});
-    let d = {};
-    try { d = await response.json(); } catch (_) { d = {}; }
-    if (!response.ok || d.ok === false) {
-      const detail = d.detail || d.message || d.error || `Request failed (HTTP ${response.status})`;
-      throw new Error(String(detail || 'Recheck could not be started'));
-    }
-    showToast('🔎 ' + (d.message || d.detail || 'All supported camera files queued for recheck'));
+    const d = await fetch('/api/recheck', {method:'POST'}).then(r => r.json());
+    showToast(d.ok ? '🔎 All .m3u/.m3u8/.txt files queued for recheck' : '❌ ' + d.detail, !d.ok);
     setTimeout(() => location.reload(), 1800);
   } catch(e) {
-    const message = (e && e.message) ? e.message : 'Unknown error while starting recheck';
-    showToast('❌ Recheck failed: ' + message, true);
-    if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
+    showToast('❌ Recheck failed: ' + e.message, true);
+    if (btn) { btn.disabled = false; btn.textContent = '🔎 Recheck'; }
   }
 }
 
