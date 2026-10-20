@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v209.0 — Recheck Error Handling
+Camera Dashboard v210.0 — Readable Operations Panel
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '209.0'
+VERSION = '210.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -7125,32 +7125,30 @@ dialog h2{margin-bottom:14px;font-size:16px;color:var(--accent)}
 @media(max-width:900px){.multi-view-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.multi-view-head{align-items:flex-start}}
 
 /* ── v63 compact live operational metrics ── */
-/* Keep the dashboard work-first: status information is compact and never dominates the camera area. */
-/* v63/v107: work-first single-line operational metrics.
-   Keep every operation visible in one horizontal strip so the camera/work area gets the space. */
-.v63-ops{margin:3px 8px 4px;padding:4px;background:var(--surf);border:1px solid var(--border);border-radius:6px}
-.v63-ops-head{display:flex;align-items:center;gap:5px;flex-wrap:nowrap;margin-bottom:3px;min-height:16px}
-.v63-ops-title{font-size:9px;font-weight:700;color:var(--accent);white-space:nowrap}
-.v63-ops-live{font-size:7px;color:var(--muted);margin-left:auto;white-space:nowrap}
-.db-maintenance-state{font-size:8px;font-weight:700;padding:2px 6px;border-radius:9px;white-space:nowrap;border:1px solid var(--border);background:var(--card)}
+/* v210: keep the operational dashboard compact, but readable at normal browser zoom. */
+.v63-ops{margin:4px 8px 6px;padding:6px;background:var(--surf);border:1px solid var(--border);border-radius:7px}
+.v63-ops-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:6px;min-height:22px}
+.v63-ops-title{font-size:12px;font-weight:750;color:var(--accent);white-space:nowrap}
+.v63-ops-live{font-size:10px;color:var(--text);margin-left:auto;white-space:normal;line-height:1.35}
+.db-maintenance-state{font-size:10px;font-weight:700;padding:3px 7px;border-radius:9px;white-space:nowrap;border:1px solid var(--border);background:var(--card)}
 .db-maintenance-state.busy{color:#ffcc66;border-color:#8a6d1f;background:rgba(138,109,31,.12)}
 .db-maintenance-state.free{color:#3fb950;border-color:#238636;background:rgba(35,134,54,.12)}
-.db-maintenance-state.failed{color:#f85149;border-color:#da3633;background:rgba(218,54,51,.10)}
-.v63-ops-grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:2px;align-items:stretch}
-.v63-metric{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:3px 4px;min-width:0;height:31px;display:grid;grid-template-columns:auto minmax(0,1fr);grid-template-rows:12px 11px;column-gap:4px;align-items:center}
-.v63-metric-label{grid-column:1 / -1;font-size:6px;color:var(--muted);text-transform:uppercase;letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1}
-.v63-metric-value{grid-column:1;font-size:10px;font-weight:700;line-height:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:0;min-width:0}
-.v63-metric-detail{grid-column:2;font-size:6px;color:var(--muted);margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;line-height:1}
-.v63-progress{grid-column:1 / -1;height:1px;background:var(--bg);border-radius:1px;overflow:hidden;margin:1px 0 0;display:none}
+.db-maintenance-state.failed{color:#ff7777;border-color:#da3633;background:rgba(218,54,51,.10)}
+.v63-ops-grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:5px;align-items:stretch}
+.v63-metric{background:var(--card);border:1px solid var(--border);border-radius:5px;padding:6px 7px;min-width:0;min-height:48px;height:auto;display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto;row-gap:4px;align-content:center}
+.v63-metric-label{grid-column:1;font-size:10px;font-weight:650;color:var(--muted);text-transform:uppercase;letter-spacing:.025em;white-space:normal;overflow-wrap:anywhere;line-height:1.2}
+.v63-metric-value{grid-column:1;font-size:13px;font-weight:750;line-height:1.15;white-space:normal;overflow-wrap:anywhere;margin:0;min-width:0;color:var(--text)}
+.v63-metric-detail{grid-column:1;font-size:9px;color:var(--text);opacity:.9;margin:0;white-space:normal;overflow-wrap:anywhere;min-width:0;line-height:1.25}
+.v63-progress{grid-column:1;height:3px;background:var(--bg);border-radius:2px;overflow:hidden;margin:2px 0 0;display:none}
 .v63-progress span{display:block;height:100%;width:0;background:var(--accent);transition:width .25s ease}
-.v63-ops-actions{display:flex;gap:2px;flex-wrap:nowrap;overflow:hidden;margin-top:3px}
-.v63-ops-actions .btn{font-size:7px;padding:2px 4px;gap:1px;white-space:nowrap;min-height:18px}
-#v66Ops .v63-ops-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:2px}
-#v66Ops .v63-metric{height:28px;padding:2px 4px}
-#v66Ops .v63-metric-value{font-size:9px}
-#v66Ops .v63-metric-detail{font-size:6px}
-@media(max-width:1200px){.v63-ops-grid{grid-template-columns:repeat(8,minmax(70px,1fr));overflow-x:auto}.v63-metric{min-width:70px}.v63-ops-actions{overflow-x:auto;scrollbar-width:thin}}
-@media(max-width:600px){.v63-ops{margin-left:4px;margin-right:4px}.v63-ops-grid{grid-template-columns:repeat(8,minmax(78px,1fr));overflow-x:auto}.v63-ops-actions{overflow-x:auto}header{gap:2px!important}}
+.v63-ops-actions{display:flex;gap:5px;flex-wrap:wrap;overflow:visible;margin-top:6px}
+.v63-ops-actions .btn{font-size:10px;padding:4px 7px;gap:3px;white-space:normal;min-height:25px;line-height:1.25}
+#v66Ops .v63-ops-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
+#v66Ops .v63-metric{min-height:48px;height:auto;padding:6px 7px}
+#v66Ops .v63-metric-value{font-size:13px}
+#v66Ops .v63-metric-detail{font-size:10px}
+@media(max-width:1200px){.v63-ops-grid{grid-template-columns:repeat(4,minmax(130px,1fr))}.v63-ops-actions{overflow:visible}}
+@media(max-width:700px){.v63-ops{margin-left:4px;margin-right:4px}.v63-ops-grid,#v66Ops .v63-ops-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.v63-ops-actions{overflow:visible}header{gap:3px!important}}
 </style>
 </head>
 <body>
