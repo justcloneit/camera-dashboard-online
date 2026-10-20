@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v211.0 — Readable Operations Panel
+Camera Dashboard v212.0 — High-Readability Operations Panel
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '211.0'
+VERSION = '212.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -7135,31 +7135,37 @@ dialog h2{margin-bottom:14px;font-size:16px;color:var(--accent)}
 .multi-status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;background:rgba(0,0,0,.35);pointer-events:none}
 @media(max-width:900px){.multi-view-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.multi-view-head{align-items:flex-start}}
 
-/* ── v63 compact live operational metrics ── */
-/* v210: keep the operational dashboard compact, but readable at normal browser zoom. */
-.v63-ops{margin:4px 8px 6px;padding:6px;background:var(--surf);border:1px solid var(--border);border-radius:7px}
-.v63-ops-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:6px;min-height:22px}
-.v63-ops-title{font-size:12px;font-weight:750;color:var(--accent);white-space:nowrap}
-.v63-ops-live{font-size:10px;color:var(--text);margin-left:auto;white-space:normal;line-height:1.35}
-.db-maintenance-state{font-size:10px;font-weight:700;padding:3px 7px;border-radius:9px;white-space:nowrap;border:1px solid var(--border);background:var(--card)}
+/* ── v63 live operational metrics — accessible text sizing and contrast ── */
+/* v212: prioritize readability on desktop and laptop screens, not ultra-compact text. */
+.v63-ops{margin:6px 8px 8px;padding:9px;background:var(--surf);border:1px solid var(--border);border-radius:8px}
+.v63-ops-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:8px;min-height:26px}
+.v63-ops-title{font-size:15px;font-weight:800;color:#79c0ff;white-space:nowrap}
+.v63-ops-live{font-size:12px;color:#e6edf3;margin-left:auto;white-space:normal;line-height:1.45}
+.db-maintenance-state{font-size:12px;font-weight:700;padding:3px 7px;border-radius:9px;white-space:nowrap;border:1px solid var(--border);background:var(--card)}
 .db-maintenance-state.busy{color:#ffcc66;border-color:#8a6d1f;background:rgba(138,109,31,.12)}
 .db-maintenance-state.free{color:#3fb950;border-color:#238636;background:rgba(35,134,54,.12)}
 .db-maintenance-state.failed{color:#ff7777;border-color:#da3633;background:rgba(218,54,51,.10)}
-.v63-ops-grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:5px;align-items:stretch}
-.v63-metric{background:var(--card);border:1px solid var(--border);border-radius:5px;padding:6px 7px;min-width:0;min-height:48px;height:auto;display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto;row-gap:4px;align-content:center}
-.v63-metric-label{grid-column:1;font-size:10px;font-weight:650;color:var(--muted);text-transform:uppercase;letter-spacing:.025em;white-space:normal;overflow-wrap:anywhere;line-height:1.2}
-.v63-metric-value{grid-column:1;font-size:13px;font-weight:750;line-height:1.15;white-space:normal;overflow-wrap:anywhere;margin:0;min-width:0;color:var(--text)}
-.v63-metric-detail{grid-column:1;font-size:9px;color:var(--text);opacity:.9;margin:0;white-space:normal;overflow-wrap:anywhere;min-width:0;line-height:1.25}
+.v63-ops-grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:7px;align-items:stretch}
+.v63-metric{background:var(--card);border:1px solid #46515f;border-radius:6px;padding:9px 10px;min-width:0;min-height:66px;height:auto;display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto;row-gap:5px;align-content:center}
+.v63-metric-label{grid-column:1;font-size:12px;font-weight:750;color:#c9d1d9;text-transform:uppercase;letter-spacing:.035em;white-space:normal;overflow-wrap:anywhere;line-height:1.3}
+.v63-metric-value{grid-column:1;font-size:16px;font-weight:800;line-height:1.25;white-space:normal;overflow-wrap:anywhere;margin:0;min-width:0;color:#f0f6fc}
+.v63-metric-detail{grid-column:1;font-size:12px;color:#e6edf3;opacity:1;margin:0;white-space:normal;overflow-wrap:anywhere;min-width:0;line-height:1.4}
 .v63-progress{grid-column:1;height:3px;background:var(--bg);border-radius:2px;overflow:hidden;margin:2px 0 0;display:none}
 .v63-progress span{display:block;height:100%;width:0;background:var(--accent);transition:width .25s ease}
 .v63-ops-actions{display:flex;gap:5px;flex-wrap:wrap;overflow:visible;margin-top:6px}
-.v63-ops-actions .btn{font-size:10px;padding:4px 7px;gap:3px;white-space:normal;min-height:25px;line-height:1.25}
+.v63-ops-actions .btn{font-size:12px;padding:6px 9px;gap:4px;white-space:normal;min-height:30px;line-height:1.35}
 #v66Ops .v63-ops-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
-#v66Ops .v63-metric{min-height:48px;height:auto;padding:6px 7px}
-#v66Ops .v63-metric-value{font-size:13px}
-#v66Ops .v63-metric-detail{font-size:10px}
+#v66Ops .v63-metric{min-height:66px;height:auto;padding:9px 10px}
+#v66Ops .v63-metric-value{font-size:16px}
+#v66Ops .v63-metric-detail{font-size:12px}
 @media(max-width:1200px){.v63-ops-grid{grid-template-columns:repeat(4,minmax(130px,1fr))}.v63-ops-actions{overflow:visible}}
 @media(max-width:700px){.v63-ops{margin-left:4px;margin-right:4px}.v63-ops-grid,#v66Ops .v63-ops-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.v63-ops-actions{overflow:visible}header{gap:3px!important}}
+/* v212 readability overrides: never shrink operational text below comfortable sizes. */
+#v63Ops .v63-metric-label,#v66Ops .v63-metric-label{font-size:12px;color:#c9d1d9}
+#v63Ops .v63-metric-value,#v66Ops .v63-metric-value{font-size:16px;color:#f0f6fc}
+#v63Ops .v63-metric-detail,#v66Ops .v63-metric-detail{font-size:12px;color:#e6edf3;opacity:1}
+#v63Ops .v63-ops-title,#v66Ops .v63-ops-title{font-size:15px}
+#v63Ops .v63-ops-actions .btn{font-size:12px;min-height:30px}
 </style>
 </head>
 <body>
