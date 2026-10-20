@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v210.0 — Readable Operations Panel
+Camera Dashboard v211.0 — Readable Operations Panel
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '210.0'
+VERSION = '211.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -6984,6 +6984,17 @@ main{padding:10px 14px;max-width:1800px;margin:0 auto}
   cursor:pointer;user-select:none;transition:border-color .15s}
 .section-header:hover{border-color:var(--accent)}
 .section-header h2{font-size:13px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* v211 accessibility: make operational labels legible on dark displays */
+.ops-panel,.ops-panel *,.live-operations,.advanced-observability{font-size:13px}
+.section-header h2{font-size:14px;color:#f1f5f9}
+.category-progress{font-size:12px;color:#ffd166;font-weight:700}
+.hdr-stats{font-size:13px;color:#f1f5f9}
+.stat-pill{font-size:12px;padding:2px 8px}
+.val-txt{font-size:12px;color:#d5deea}
+.sec-mini{font-size:12px;color:#e5edf7}
+.cam-location{font-size:12px;color:#c5d0de}
+button.btn,header .btn{font-size:12px;font-weight:600}
+@media(max-width:900px){.hdr-stats{white-space:normal;flex-wrap:wrap}.section-header h2{white-space:normal}}
 .chevron{font-size:10px;color:var(--muted);transition:transform .2s;flex-shrink:0}
 .group-section.expanded .chevron{transform:rotate(90deg)}
 .badge{background:var(--accent);color:#000;border-radius:10px;padding:1px 7px;
@@ -8032,32 +8043,47 @@ async function recheckFiles() {
   const originalLabel = '🔎 Recheck';
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Rechecking…'; }
   try {
-    const response = await fetch('/api/recheck', {
-      method: 'POST',
-      headers: {'Accept': 'application/json'}
-    });
-    let d = {};
+    const response = await fetch('/api/recheck', {method:'POST', headers:{'Accept':'application/json'}});
+    let d;
     try { d = await response.json(); }
     catch (_) { throw new Error('Server returned a non-JSON response (HTTP ' + response.status + '). Check dashboard.log.'); }
-
-    if (!response.ok || !d.ok) {
-      const message = d.message || d.detail || d.error ||
-        ('Request failed with HTTP ' + response.status);
-      showToast('❌ Recheck not started: ' + message, true);
-      if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
-      return;
+    if (!response.ok || !d || d.ok !== true) {
+      throw new Error((d && (d.message || d.detail || d.error)) || ('Request failed with HTTP ' + response.status));
     }
-
-    showToast('🔎 ' + (d.message || 'Camera files queued for recheck.'), false);
-    // The endpoint starts a background scan. Do not reload immediately; that can
-    // interrupt the user's view and hide the server's actual result.
-    if (btn) btn.title = 'Recheck accepted. Watch dashboard.log for scan progress.';
+    showToast('🔎 ' + (d.message || 'Camera file recheck started.'), false);
+    // Poll the scanner's real server-side state so the user sees progress/results.
+    let lastPhase = '';
+    const deadline = Date.now() + 30 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      let statusResponse = await fetch('/api/v110/scan/status', {headers:{'Accept':'application/json'}});
+      if (!statusResponse.ok) continue;
+      let payload;
+      try { payload = await statusResponse.json(); } catch (_) { continue; }
+      const scan = payload && payload.scan;
+      if (!scan) continue;
+      const phase = String(scan.phase || '');
+      if (phase !== lastPhase && scan.running) {
+        lastPhase = phase;
+        showToast('🔎 Scan: ' + (phase || 'working') + ' · processed ' + Number(scan.processed || 0).toLocaleString() + ' · added ' + Number(scan.added || 0).toLocaleString(), false);
+      }
+      if (!scan.running && ['complete','error','cancelled'].includes(phase)) {
+        if (phase === 'complete') {
+          showToast('✅ Recheck complete: ' + Number(scan.processed || 0).toLocaleString() + ' processed, ' + Number(scan.added || 0).toLocaleString() + ' new, ' + Number(scan.updated || 0).toLocaleString() + ' existing updated, ' + Number(scan.failed || 0).toLocaleString() + ' failed.', Number(scan.failed || 0) > 0);
+        } else {
+          showToast('❌ Recheck ' + phase + ': ' + (scan.last_error || 'see dashboard.log'), true);
+        }
+        break;
+      }
+    }
+    if (Date.now() >= deadline) showToast('Recheck is still running. Open Diagnostics → Scan status for progress.', false);
   } catch(e) {
-    showToast('❌ Recheck failed: ' + (e && e.message ? e.message : String(e)), true);
+    const message = e && e.message ? e.message : String(e || 'Unknown error');
+    showToast('❌ Recheck failed: ' + message, true);
+  } finally {
     if (btn) { btn.disabled = false; btn.textContent = originalLabel; }
   }
 }
-
 async function sendCameraList() {
   showToast('📤 Building compressed camera export…');
   try {
