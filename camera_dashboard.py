@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v214.0 — High-Readability Operations Panel
+Camera Dashboard v215.0 — Scan Progress and Import Diagnostics
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '214.0'
+VERSION = '215.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -5491,7 +5491,18 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
         paths.sort()
     file_counts = {ext: len(paths) for ext, paths in source_files.items()}
     _scan_state_set(files_total=sum(file_counts.values()), files_processed=0,
-                    file_counts=file_counts, scan_root=str(root), phase='reading files')
+                    file_counts=file_counts, scan_root=str(root), phase='reading files',
+                    current_file='', last_error='')
+    file_progress = [0]
+    def note_file(path: Path, phase: str = 'reading files') -> None:
+        file_progress[0] += 1
+        _scan_state_set(files_processed=file_progress[0], current_file=path.name,
+                        phase=phase, file_counts=file_counts, scan_root=str(root))
+        if file_progress[0] == 1 or file_progress[0] % 10 == 0 or file_progress[0] >= sum(file_counts.values()):
+            log.info('[Scanner] File progress: files=%d/%d current=%s records=%d added=%d updated=%d failed=%d',
+                     file_progress[0], sum(file_counts.values()), path.name,
+                     _scan_state_snapshot().get('processed', 0), _scan_state_snapshot().get('added', 0),
+                     _scan_state_snapshot().get('updated', 0), _scan_state_snapshot().get('failed', 0))
     log.info('[Scanner] Indexed supported files once under %s: %s', root,
              ', '.join(f'{ext}={len(paths)}' for ext, paths in source_files.items()))
 
@@ -5523,6 +5534,7 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
             pass
 
     for txt in source_files['.txt']:
+        note_file(txt)
         if _should_skip(txt, root):
             continue
         current_sources.add(str(txt))
@@ -5623,6 +5635,7 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
         flush_batch()
 
     for m3u in sorted(source_files['.m3u'] + source_files['.m3u8']):
+        note_file(m3u)
         if _should_skip(m3u, root):
             continue
         current_sources.add(str(m3u))
@@ -5634,6 +5647,7 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
         flush_batch()
 
     for jf in source_files['.json']:
+        note_file(jf)
         if _should_skip(jf, root) or jf.name in {'package.json', 'package-lock.json'}:
             continue
         current_sources.add(str(jf))
@@ -5652,6 +5666,7 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
         flush_batch()
 
     for cf in source_files['.csv']:
+        note_file(cf)
         if _should_skip(cf, root):
             continue
         current_sources.add(str(cf))
@@ -5663,6 +5678,7 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
         flush_batch()
 
     for xf in source_files['.xml']:
+        note_file(xf)
         if _should_skip(xf, root):
             continue
         current_sources.add(str(xf))
@@ -8062,6 +8078,10 @@ async function recheckFiles() {
     showToast('🔎 ' + (d.message || 'Camera file recheck started.'), false);
     // Poll the scanner's real server-side state so the user sees progress/results.
     let lastPhase = '';
+    const baselineScanStartedAt = d.scan && d.scan.started_at ? String(d.scan.started_at) : '';
+    let sawThisScanRunning = false;
+    let lastProgressToastAt = 0;
+    let lastProgressSignature = '';
     const deadline = Date.now() + 30 * 60 * 1000;
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 2000));
@@ -8072,11 +8092,20 @@ async function recheckFiles() {
       const scan = payload && payload.scan;
       if (!scan) continue;
       const phase = String(scan.phase || '');
-      if (phase !== lastPhase && scan.running) {
-        lastPhase = phase;
-        showToast('🔎 Scan: ' + (phase || 'working') + ' · processed ' + Number(scan.processed || 0).toLocaleString() + ' · added ' + Number(scan.added || 0).toLocaleString(), false);
+      if (scan.running && (!baselineScanStartedAt || String(scan.started_at || '') !== baselineScanStartedAt)) sawThisScanRunning = true;
+      if (scan.running) {
+        const fileLabel = scan.current_file ? (' · file ' + scan.current_file) : '';
+        const progressSignature = [phase,scan.files_processed,scan.files_total,scan.processed,scan.added,scan.updated,scan.failed,scan.current_file].join('|');
+        const now = Date.now();
+        if (phase !== lastPhase || (progressSignature !== lastProgressSignature && now - lastProgressToastAt >= 12000)) {
+          lastPhase = phase;
+          lastProgressSignature = progressSignature;
+          lastProgressToastAt = now;
+          showToast('🔎 Scan ' + Number(scan.files_processed || 0).toLocaleString() + '/' + Number(scan.files_total || 0).toLocaleString() + ' files · ' + (phase || 'working') + fileLabel + ' · records ' + Number(scan.processed || 0).toLocaleString() + ' · new ' + Number(scan.added || 0).toLocaleString() + ' · updated ' + Number(scan.updated || 0).toLocaleString() + ' · failed ' + Number(scan.failed || 0).toLocaleString(), false);
+        }
       }
-      if (!scan.running && ['complete','error','cancelled'].includes(phase)) {
+      const belongsToThisRecheck = sawThisScanRunning || (scan.started_at && String(scan.started_at) !== baselineScanStartedAt);
+      if (!scan.running && belongsToThisRecheck && ['complete','error','cancelled'].includes(phase)) {
         if (phase === 'complete') {
           showToast('✅ Recheck complete: ' + Number(scan.processed || 0).toLocaleString() + ' processed, ' + Number(scan.added || 0).toLocaleString() + ' new, ' + Number(scan.updated || 0).toLocaleString() + ' existing updated, ' + Number(scan.failed || 0).toLocaleString() + ' failed.', Number(scan.failed || 0) > 0);
         } else {
@@ -9813,7 +9842,12 @@ def _scan_and_upsert(force: bool = False) -> list[dict]:
         except Exception: pass
         return []
     except Exception as exc:
-        _scan_state_set(running=False,phase='error',finished_at=utc_iso(),last_error=str(exc)[:500],**totals); raise
+        _scan_state_set(running=False,phase='error',finished_at=utc_iso(),last_error=str(exc)[:500],**totals)
+        log.exception('[Scanner] Failed: phase=%s files=%s/%s current_file=%s processed=%s added=%s updated=%s failed=%s',
+                      _scan_state_snapshot().get('phase'), _scan_state_snapshot().get('files_processed'),
+                      _scan_state_snapshot().get('files_total'), _scan_state_snapshot().get('current_file'),
+                      totals['processed'], totals['added'], totals['updated'], totals['failed'])
+        raise
 
 
 def _background_scanner() -> None:
@@ -17151,7 +17185,9 @@ def _system_db_health():
 def v110_health(): return jsonify({'ok':True,**_system_db_health()})
 
 @app.route('/api/v110/scan/status')
-def v110_scan_status(): return jsonify({'ok':True,'scan':_scan_state_snapshot(),'storage':_storage_status()})
+def v110_scan_status():
+    scan = _scan_state_snapshot()
+    return jsonify({'ok':True,'scan':scan,'scan_root':scan.get('scan_root',_SEARCH_DIR),'storage':_storage_status()})
 
 @app.route('/api/v110/scan/control',methods=['POST'])
 def v110_scan_control():
