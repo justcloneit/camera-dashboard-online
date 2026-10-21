@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v215.0 — Scan Progress and Import Diagnostics
+Camera Dashboard v216.0 — Queue Lease and Import Diagnostics
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '215.0'
+VERSION = '216.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -2523,7 +2523,7 @@ def _db_maintenance_snapshot():
         return dict(_DB_MAINTENANCE_STATE)
 
 _SCAN_STATE_LOCK = threading.RLock()
-_SCAN_STATE = {'running':False,'paused':False,'cancel_requested':False,'force':False,'phase':'idle','started_at':'','updated_at':'','finished_at':'','files_total':0,'files_processed':0,'discovered':0,'processed':0,'added':0,'updated':0,'skipped':0,'failed':0,'current_file':'','last_error':'','last_scan_at':''}
+_SCAN_STATE = {'running':False,'paused':False,'cancel_requested':False,'force':False,'phase':'idle','started_at':'','updated_at':'','finished_at':'','files_total':0,'files_processed':0,'discovered':0,'processed':0,'added':0,'updated':0,'new_feeds':0,'skipped':0,'failed':0,'current_file':'','last_error':'','last_scan_at':''}
 _SCAN_PAUSE = threading.Event()
 _SCAN_CANCEL = threading.Event()
 def _scan_state_set(**updates):
@@ -4231,20 +4231,22 @@ def _claim_validation_batch(limit: int, worker_id: str) -> list[dict]:
     limit = max(1, min(int(limit), 2000))
 
     def _write():
-        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-        lease = (datetime.now(timezone.utc) + timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        # Use SQLite's own canonical timestamp format for both lease creation
+        # and expiry comparisons. Mixing ISO 'T...Z' with SQLite 'YYYY-MM-DD HH'
+        # strings can make lexical comparisons treat a live lease as expired.
         c = _db_conn()
         rows = c.execute("""
             SELECT c.* FROM cameras c JOIN validation_queue q ON q.camera_id=c.id
             WHERE c.deleted=0 AND q.next_attempt <= datetime('now')
-              AND (q.locked_until IS NULL OR q.locked_until < ?)
+              AND (q.locked_until IS NULL OR datetime(q.locked_until) < datetime('now'))
             ORDER BY CASE WHEN COALESCE(q.attempts,0)=0 THEN 0 ELSE 1 END,q.priority,q.next_attempt,c.id LIMIT ?
-        """, (now, limit)).fetchall()
+        """, (limit,)).fetchall()
         ids = [r['id'] for r in rows]
         if ids:
             ph = ','.join('?' * len(ids))
-            c.execute(f"""UPDATE validation_queue SET locked_until=?,locked_by=?
-                          WHERE camera_id IN ({ph})""", [lease, worker_id, *ids])
+            c.execute(f"""UPDATE validation_queue
+                          SET locked_until=datetime('now','+15 minutes'),locked_by=?
+                          WHERE camera_id IN ({ph})""", [worker_id, *ids])
             c.commit()
         return rows
 
@@ -5458,15 +5460,40 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
         last_batch_flush = time.monotonic()
 
     def add(cams: list[dict]) -> None:
+        # A camera may occur in several source files with different RTSP feeds.
+        # Keep one database row per camera ID, but merge feeds into the pending
+        # record instead of silently dropping later-file feeds as duplicates.
+        pending_by_id = {str(item.get('id') or ''): item for item in pending_batch if item.get('id')}
         for cam in cams:
-            cid = cam.get('id', '')
-            if cid and cid not in seen_ids:
-                seen_ids.add(cid)
-                pending_batch.append(cam)
-                if collect:
-                    cameras.append(cam)
-                if on_batch and len(pending_batch) >= SCAN_BATCH_SIZE:
-                    flush_batch(force=True)
+            cid = str(cam.get('id') or '')
+            if not cid:
+                continue
+            if cid in pending_by_id:
+                existing = pending_by_id[cid]
+                urls = list(existing.get('rtsp_urls') or [])
+                for url in cam.get('rtsp_urls') or []:
+                    if isinstance(url, str) and url and url not in urls:
+                        urls.append(url)
+                existing['rtsp_urls'] = urls
+                # Prefer populated metadata from the later source without
+                # replacing useful existing values with empty placeholders.
+                for key in ('label','ip','port','camera_type','username','password','country','region','city','web_url','device_id','channel_name','geo_source','geo_confidence'):
+                    value = cam.get(key)
+                    if value not in (None, ''):
+                        existing[key] = value
+                continue
+            if cid in seen_ids:
+                # Already flushed to SQLite: db_bulk_upsert merges any new URLs.
+                # A second occurrence is not counted as a second camera row.
+                continue
+            seen_ids.add(cid)
+            pending_batch.append(cam)
+            pending_by_id[cid] = cam
+            if collect:
+                cameras.append(cam)
+            if on_batch and len(pending_batch) >= SCAN_BATCH_SIZE:
+                flush_batch(force=True)
+                pending_by_id = {str(item.get('id') or ''): item for item in pending_batch if item.get('id')}
 
     # Index supported files in one pruned filesystem walk. Repeated root.rglob()
     # calls for each extension made large workspace scans unnecessarily slow.
@@ -6149,7 +6176,10 @@ def start_validation_queue_worker(max_workers: int | None = None,
     def _run():
         current_workers, current_batch_limit = initial_workers, initial_batch_limit
         restart_after_exit = False
+        last_idle_log = 0.0
         _touch_worker('validation-queue', 'starting', worker_id)
+        log.info('[Validator] Queue worker starting: worker_id=%s configured_workers=%d initial_batch=%d',
+                 worker_id, current_workers, current_batch_limit)
         if _validation_queue_restart_requested.is_set():
             # A restart request made before this replacement worker started is
             # consumed here so the replacement does not immediately stop again.
@@ -6188,7 +6218,19 @@ def start_validation_queue_worker(max_workers: int | None = None,
                     fair_claim_limit = min(current_batch_limit, max(25, current_workers * 4))
                     claimed = _claim_validation_batch(fair_claim_limit, worker_id)
                     if not claimed:
-                        _touch_worker('validation-queue', 'idle', 'queue empty; polling for newly discovered cameras')
+                        _touch_worker('validation-queue', 'idle', 'no due/unlocked validation rows; polling')
+                        now_mono = time.monotonic()
+                        if now_mono - last_idle_log >= 60.0:
+                            try:
+                                qrow = _db_conn().execute("""SELECT COUNT(*) AS total,
+                                    SUM(CASE WHEN next_attempt <= datetime('now') THEN 1 ELSE 0 END) AS due,
+                                    SUM(CASE WHEN locked_until IS NOT NULL AND datetime(locked_until) >= datetime('now') THEN 1 ELSE 0 END) AS leased
+                                    FROM validation_queue""").fetchone()
+                                log.info('[Validator] Queue idle: total=%d due=%d active_leases=%d worker_id=%s',
+                                         int(qrow['total'] or 0), int(qrow['due'] or 0), int(qrow['leased'] or 0), worker_id)
+                            except Exception as diag_exc:
+                                log.warning('[Validator] Queue idle diagnostics failed: %s', diag_exc)
+                            last_idle_log = now_mono
                         _validation_queue_restart_requested.wait(3.0)
                         continue
                     ids = [cam['id'] for cam in claimed]
@@ -6210,7 +6252,8 @@ def start_validation_queue_worker(max_workers: int | None = None,
                         _VALIDATION_RUN_LOCK.release()
                         slot_held = False
             except Exception as e:
-                log.warning('[Validator] Queue worker error: %s', e)
+                log.exception('[Validator] Queue worker error (worker_id=%s claimed=%d): %s',
+                              worker_id, len(claimed), e)
                 if claimed:
                     _release_validation_claims([c['id'] for c in claimed], worker_id)
                 _record_recovery_event('validation_batch', worker_id, 'failed',
@@ -9805,24 +9848,37 @@ def _scan_and_upsert(force: bool = False) -> list[dict]:
             'failed': 0, 'current_file': '', 'last_error': '',
             'updated_at': utc_iso(),
         })
-    totals={'discovered':0,'processed':0,'added':0,'updated':0,'skipped':0,'failed':0}
+    totals={'discovered':0,'processed':0,'added':0,'updated':0,'new_feeds':0,'skipped':0,'failed':0}
     last_progress_log = [0.0]
     def batch_upsert(batch):
         if _SCAN_CANCEL.is_set(): return
         while _SCAN_PAUSE.is_set() and not _SCAN_CANCEL.is_set(): _scan_state_set(phase='paused',paused=True); time.sleep(.25)
         if _SCAN_CANCEL.is_set(): return
         _scan_state_set(phase='writing batch',paused=False,discovered=totals['discovered']+len(batch))
-        ids=[str(x.get('id') or '') for x in batch if x.get('id')]; before=set()
+        ids=[str(x.get('id') or '') for x in batch if x.get('id')]; before=set(); before_urls={}
         try:
             c=_db_conn()
             for pos in range(0,len(ids),400):
-                chunk=ids[pos:pos+400]; ph=','.join('?'*len(chunk)); before.update(r['id'] for r in c.execute(f'SELECT id FROM cameras WHERE id IN ({ph})',chunk).fetchall())
-            db_bulk_upsert(batch); totals['processed']+=len(batch); totals['discovered']+=len(batch); totals['added']+=sum(1 for x in ids if x not in before); totals['updated']+=sum(1 for x in ids if x in before)
-            _scan_state_set(discovered=totals['discovered'],processed=totals['processed'],added=totals['added'],updated=totals['updated'])
+                chunk=ids[pos:pos+400]; ph=','.join('?'*len(chunk))
+                for r in c.execute(f'SELECT id,rtsp_urls FROM cameras WHERE id IN ({ph})',chunk).fetchall():
+                    before.add(r['id'])
+                    try:
+                        parsed=json.loads(r['rtsp_urls'] or '[]')
+                        before_urls[r['id']]=set(u for u in parsed if isinstance(u,str)) if isinstance(parsed,list) else set()
+                    except Exception:
+                        before_urls[r['id']]=set()
+            batch_new_feeds=0
+            for cam in batch:
+                cid=str(cam.get('id') or '')
+                if not cid: continue
+                prior=before_urls.get(cid,set())
+                batch_new_feeds += len({u for u in cam.get('rtsp_urls',[]) if isinstance(u,str) and u} - prior)
+            db_bulk_upsert(batch); totals['processed']+=len(batch); totals['discovered']+=len(batch); totals['added']+=sum(1 for x in ids if x not in before); totals['updated']+=sum(1 for x in ids if x in before); totals['new_feeds']+=batch_new_feeds
+            _scan_state_set(discovered=totals['discovered'],processed=totals['processed'],added=totals['added'],updated=totals['updated'],new_feeds=totals['new_feeds'])
             now = time.monotonic()
             if last_progress_log[0] == 0.0 or now - last_progress_log[0] >= 5.0:
-                log.info('[Scanner] Live progress: records_seen=%d processed=%d new_camera_ids=%d existing_camera_ids_updated=%d failed=%d',
-                         totals['discovered'], totals['processed'], totals['added'], totals['updated'], totals['failed'])
+                log.info('[Scanner] Live progress: records_seen=%d processed=%d new_camera_ids=%d existing_camera_ids_updated=%d new_rtsp_feeds=%d failed=%d',
+                         totals['discovered'], totals['processed'], totals['added'], totals['updated'], totals['new_feeds'], totals['failed'])
                 last_progress_log[0] = now
         except Exception as exc:
             totals['failed']+=len(batch); _scan_state_set(failed=totals['failed'],last_error=str(exc)[:500]); raise
@@ -9834,10 +9890,11 @@ def _scan_and_upsert(force: bool = False) -> list[dict]:
             db_reconcile_source(source_file,found_ids)
         if not _SCAN_CANCEL.is_set(): db_prune_deleted(limit=1000,retention_days=DELETED_RETENTION_DAYS)
         finished=utc_iso(); _scan_state_set(running=False,phase='cancelled' if _SCAN_CANCEL.is_set() else 'complete',cancel_requested=_SCAN_CANCEL.is_set(),finished_at=finished,last_scan_at=finished,**totals)
-        log.info('[Scanner] %s: records_seen=%d processed=%d new_camera_ids=%d existing_camera_ids_updated=%d skipped=%d failed=%d',
-                 'Cancelled' if _SCAN_CANCEL.is_set() else 'Complete',
+        log.info('[Scanner] %s: root=%s files=%d/%d records_seen=%d processed=%d new_camera_ids=%d existing_camera_ids_updated=%d new_rtsp_feeds=%d skipped=%d failed=%d',
+                 'Cancelled' if _SCAN_CANCEL.is_set() else 'Complete', _SEARCH_DIR,
+                 _scan_state_snapshot().get('files_processed', 0), _scan_state_snapshot().get('files_total', 0),
                  totals['discovered'], totals['processed'], totals['added'],
-                 totals['updated'], totals['skipped'], totals['failed'])
+                 totals['updated'], totals['new_feeds'], totals['skipped'], totals['failed'])
         try: _db_retry_write(lambda: _db_conn().execute('INSERT INTO scan_history(started_at,finished_at,force_scan,discovered,processed,added,updated,skipped,failed,detail) VALUES(?,?,?,?,?,?,?,?,?,?)',(started,finished,int(force),totals['discovered'],totals['processed'],totals['added'],totals['updated'],totals['skipped'],totals['failed'],'cancelled' if _SCAN_CANCEL.is_set() else 'ok')).connection.commit(),'scan history')
         except Exception: pass
         return []
@@ -13014,9 +13071,9 @@ def api_recheck() -> Response:
                 validation_started = bool(start_background_validation(
                     batch, delay=1.0, max_workers=_validation_worker_config()[0], scope='recheck'))
             log.info(
-                '[Recheck] Complete: root=%s records_seen=%d processed=%d added=%d updated=%d skipped=%d failed=%d validation_batch=%d validation_started=%s',
-                _SEARCH_DIR, scan.get('discovered', 0), scan.get('processed', 0),
-                scan.get('added', 0), scan.get('updated', 0), scan.get('skipped', 0),
+                '[Recheck] Complete: root=%s files=%d/%d records_seen=%d processed=%d added=%d updated=%d new_rtsp_feeds=%d skipped=%d failed=%d validation_batch=%d validation_started=%s',
+                _SEARCH_DIR, scan.get('files_processed', 0), scan.get('files_total', 0), scan.get('discovered', 0), scan.get('processed', 0),
+                scan.get('added', 0), scan.get('updated', 0), scan.get('new_feeds', 0), scan.get('skipped', 0),
                 scan.get('failed', 0), len(batch), validation_started)
         except Exception as exc:
             _scan_state_set(last_error=str(exc)[:500])
