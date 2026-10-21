@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v216.0 — Queue Lease and Import Diagnostics
+Camera Dashboard v217.0 — Queue Lease and Import Diagnostics
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '216.0'
+VERSION = '217.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -5593,11 +5593,11 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                     line = raw.strip()
                     if not line or line.startswith('#') or line.lower().startswith(('rtsp://', 'rtsps://')):
                         continue
-                    parts = [p.strip() for p in re.split(r'[,;\\t ]+', line) if p.strip()]
+                    parts = [p.strip() for p in re.split(r'[,;\t ]+', line) if p.strip()]
                     if len(parts) < 3:
                         continue
                     target = parts[0]
-                    if not re.match(r'^(?:[A-Za-z0-9._-]+)(?::\\d{1,5})?$', target):
+                    if not re.match(r'^(?:[A-Za-z0-9._-]+)(?::\d{1,5})?$', target):
                         continue
                     host, port = (target.rsplit(':', 1) if
                                   ':' in target and target.rsplit(':', 1)[1].isdigit()
