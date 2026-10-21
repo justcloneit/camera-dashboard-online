@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v213.0 — High-Readability Operations Panel
+Camera Dashboard v214.0 — High-Readability Operations Panel
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '213.0'
+VERSION = '214.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -5489,7 +5489,10 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                 source_files[ext].append(path)
     for paths in source_files.values():
         paths.sort()
-    log.info('[Scanner] Indexed supported files once: %s',
+    file_counts = {ext: len(paths) for ext, paths in source_files.items()}
+    _scan_state_set(files_total=sum(file_counts.values()), files_processed=0,
+                    file_counts=file_counts, scan_root=str(root), phase='reading files')
+    log.info('[Scanner] Indexed supported files once under %s: %s', root,
              ', '.join(f'{ext}={len(paths)}' for ext, paths in source_files.items()))
 
     def changed(path: Path) -> bool:
@@ -12964,24 +12967,33 @@ def api_recheck() -> Response:
     """Force-read every supported playlist/text file without a 364K burst."""
     def _run():
         try:
+            # The scan root defaults to the directory containing this script.
+            # Force mode rereads supported files even when size/mtime are unchanged.
             _scan_and_upsert(force=True)
-            cameras = []
+            scan = _scan_state_snapshot()
             _, batch_limit = _validation_worker_config()
             batch = db_get_resume_batch(batch_limit)
+            validation_started = False
             if batch:
                 ids = [cam['id'] for cam in batch]
                 db_set_status_bulk(ids, 'checking')
-                start_background_validation(batch, delay=1.0,
-                                           max_workers=_validation_worker_config()[0], scope='recheck')
-            log.info('[Recheck] Forced file scan found %d cameras; validation batch=%d',
-                     len(batch))
-        except Exception:
+                validation_started = bool(start_background_validation(
+                    batch, delay=1.0, max_workers=_validation_worker_config()[0], scope='recheck'))
+            log.info(
+                '[Recheck] Complete: root=%s records_seen=%d processed=%d added=%d updated=%d skipped=%d failed=%d validation_batch=%d validation_started=%s',
+                _SEARCH_DIR, scan.get('discovered', 0), scan.get('processed', 0),
+                scan.get('added', 0), scan.get('updated', 0), scan.get('skipped', 0),
+                scan.get('failed', 0), len(batch), validation_started)
+        except Exception as exc:
+            _scan_state_set(last_error=str(exc)[:500])
             log.exception('[Recheck] Forced file scan failed')
     with _SCAN_STATE_LOCK:
         if _SCAN_STATE.get('running'):
-            return jsonify({'ok': False, 'running': True, 'message': 'A camera scan is already running; the recheck was not started.'}), 409
+            return jsonify({'ok': False, 'running': True, 'scan': _scan_state_snapshot(),
+                            'message': 'A camera scan is already running; the new recheck was not started.'}), 409
     threading.Thread(target=_run, daemon=True, name='recheck-files').start()
-    return jsonify({'ok': True, 'message': 'All supported camera files are being rechecked'})
+    return jsonify({'ok': True, 'message': 'Recheck started: scanning supported files beside the script. Check scan status for added/updated/failed counts.',
+                    'scan_root': _SEARCH_DIR, 'scan': _scan_state_snapshot()})
 
 
 @app.route('/api/refresh/group/<path:group_name>', methods=['POST'])
