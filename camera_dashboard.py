@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v217.0 — Queue Lease and Import Diagnostics
+Camera Dashboard v218.0 — Discovery Feed Merge Fix
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -197,7 +197,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '217.0'
+VERSION = '218.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -5483,8 +5483,17 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                         existing[key] = value
                 continue
             if cid in seen_ids:
-                # Already flushed to SQLite: db_bulk_upsert merges any new URLs.
-                # A second occurrence is not counted as a second camera row.
+                # This ID was already seen in another source file and may already
+                # have been flushed to SQLite. Do NOT drop the occurrence: its
+                # RTSP URL(s) or metadata may be new. db_bulk_upsert merges the
+                # incoming URLs with the existing row, so enqueue it again when
+                # it is no longer in the in-memory batch. Only the first sighting
+                # is returned/collected as a distinct camera.
+                pending_batch.append(cam)
+                pending_by_id[cid] = cam
+                if on_batch and len(pending_batch) >= SCAN_BATCH_SIZE:
+                    flush_batch(force=True)
+                    pending_by_id = {str(item.get('id') or ''): item for item in pending_batch if item.get('id')}
                 continue
             seen_ids.add(cid)
             pending_batch.append(cam)
@@ -5525,11 +5534,13 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
         file_progress[0] += 1
         _scan_state_set(files_processed=file_progress[0], current_file=path.name,
                         phase=phase, file_counts=file_counts, scan_root=str(root))
-        if file_progress[0] == 1 or file_progress[0] % 10 == 0 or file_progress[0] >= sum(file_counts.values()):
-            log.info('[Scanner] File progress: files=%d/%d current=%s records=%d added=%d updated=%d failed=%d',
-                     file_progress[0], sum(file_counts.values()), path.name,
-                     _scan_state_snapshot().get('processed', 0), _scan_state_snapshot().get('added', 0),
-                     _scan_state_snapshot().get('updated', 0), _scan_state_snapshot().get('failed', 0))
+        # Log each file start, not just every tenth file. If parsing or a DB
+        # write stalls on one unusually large source, the last log now identifies
+        # that exact file instead of leaving operators guessing for minutes.
+        log.info('[Scanner] File start: files=%d/%d current=%s processed=%d added=%d updated=%d failed=%d',
+                 file_progress[0], sum(file_counts.values()), path.name,
+                 _scan_state_snapshot().get('processed', 0), _scan_state_snapshot().get('added', 0),
+                 _scan_state_snapshot().get('updated', 0), _scan_state_snapshot().get('failed', 0))
     log.info('[Scanner] Indexed supported files once under %s: %s', root,
              ', '.join(f'{ext}={len(paths)}' for ext, paths in source_files.items()))
 
@@ -13055,7 +13066,7 @@ def api_refresh_all() -> Response:
 
 @app.route('/api/recheck', methods=['POST'])
 def api_recheck() -> Response:
-    """Force-read every supported playlist/text file without a 364K burst."""
+    """Force-read supported camera files and merge newly discovered feeds safely."""
     def _run():
         try:
             # The scan root defaults to the directory containing this script.
