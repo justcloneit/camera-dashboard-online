@@ -3515,11 +3515,26 @@ def _sync_advanced_metadata(cam):
         def _write():
             c=_db_conn()
             c.execute('''INSERT INTO device_fingerprints(device_key,camera_id,fingerprint,vendor,model,serial,last_seen,confidence) VALUES(?,?,?,?,?,?,datetime('now'),?) ON CONFLICT(device_key) DO UPDATE SET camera_id=excluded.camera_id,fingerprint=excluded.fingerprint,vendor=excluded.vendor,model=excluded.model,serial=excluded.serial,last_seen=datetime('now'),confidence=excluded.confidence''',(key,cid,fp,_safe_str(cam.get('camera_type')),_safe_str(cam.get('label')),_safe_str(cam.get('device_id')),score))
-            c.execute('DELETE FROM device_evidence WHERE camera_id=?',(cid,))
+            # Avoid deleting/reinserting evidence rows when the camera's
+            # evidence has not changed. This reduces needless SQLite writes
+            # and lock contention during periodic metadata reconciliation.
+            desired_evidence=[]
             for item in evidence:
-                if not isinstance(item,(list,tuple)) or len(item)<3: continue
-                et,res,val=item[0],item[1],item[2]; conf=item[3] if len(item)>=4 else (float(val) if isinstance(val,(int,float)) else 0.0)
-                c.execute('INSERT INTO device_evidence(camera_id,evidence_type,result,value,confidence) VALUES(?,?,?,?,?)',(cid,str(et),str(res),str(val)[:500],conf))
+                if not isinstance(item,(list,tuple)) or len(item)<3:
+                    continue
+                et,res,val=item[0],item[1],item[2]
+                conf=item[3] if len(item)>=4 else (float(val) if isinstance(val,(int,float)) else 0.0)
+                desired_evidence.append((str(et),str(res),str(val)[:500],conf))
+            desired_evidence.sort(key=lambda row: (row[0],row[1],row[2],row[3]))
+            existing_evidence=c.execute(
+                "SELECT evidence_type,result,value,confidence FROM device_evidence WHERE camera_id=? ORDER BY evidence_type,result,value,confidence",
+                (cid,)
+            ).fetchall()
+            current_evidence=[(str(row[0]),str(row[1]),str(row[2]),row[3]) for row in existing_evidence]
+            if current_evidence != desired_evidence:
+                c.execute('DELETE FROM device_evidence WHERE camera_id=?',(cid,))
+                for et,res,val,conf in desired_evidence:
+                    c.execute('INSERT INTO device_evidence(camera_id,evidence_type,result,value,confidence) VALUES(?,?,?,?,?)',(cid,et,res,val,conf))
             c.commit()
         if _shutdown_requested.is_set():
             return False
