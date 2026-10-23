@@ -4143,6 +4143,8 @@ _STATUS_SORT = "CASE status WHEN 'online' THEN 0 WHEN 'checking' THEN 1 WHEN 'un
 
 def db_bulk_upsert(cameras: list[dict]) -> int:
     # Bounded discovery upsert. Never build a giant SQLite IN (...) parameter list.
+    # v218 contention patch: unchanged camera/queue rows are not rewritten;
+    # this avoids refreshing updated_at and generating WAL traffic on every rescan.
     if not cameras:
         return 0
     c = _db_conn()
@@ -4190,11 +4192,44 @@ def db_bulk_upsert(cameras: list[dict]) -> int:
             geo_source=CASE WHEN excluded.geo_source!='' THEN excluded.geo_source ELSE cameras.geo_source END,
             geo_confidence=CASE WHEN excluded.geo_confidence!='' THEN excluded.geo_confidence ELSE cameras.geo_confidence END,
             deleted=0, deleted_at=NULL, updated_at=datetime('now')
+        WHERE
+            cameras.label IS NOT CASE
+                WHEN trim(COALESCE(excluded.label,''))='' OR lower(trim(excluded.label)) IN ('camera','unknown','generic','generic_rtsp','generic_rtsp_pending')
+                THEN cameras.label ELSE excluded.label END
+            OR cameras.ip IS NOT excluded.ip
+            OR cameras.port IS NOT excluded.port
+            OR cameras.camera_type IS NOT CASE WHEN excluded.camera_type!='' THEN excluded.camera_type ELSE cameras.camera_type END
+            OR cameras.username IS NOT CASE WHEN excluded.username!='' THEN excluded.username ELSE cameras.username END
+            OR cameras.password IS NOT CASE WHEN excluded.password!='' THEN excluded.password ELSE cameras.password END
+            OR cameras.country IS NOT CASE WHEN excluded.country!='' THEN excluded.country ELSE cameras.country END
+            OR cameras.region IS NOT CASE WHEN excluded.region!='' THEN excluded.region ELSE cameras.region END
+            OR cameras.city IS NOT CASE WHEN excluded.city!='' THEN excluded.city ELSE cameras.city END
+            OR cameras.rtsp_urls IS NOT CASE WHEN excluded.rtsp_urls!='[]' THEN excluded.rtsp_urls ELSE cameras.rtsp_urls END
+            OR cameras.web_url IS NOT CASE WHEN excluded.web_url!='' THEN excluded.web_url ELSE cameras.web_url END
+            OR cameras.source_file IS NOT excluded.source_file
+            OR cameras.group_name IS NOT excluded.group_name
+            OR cameras.device_id IS NOT CASE WHEN excluded.device_id!='' THEN excluded.device_id ELSE cameras.device_id END
+            OR cameras.channel_index IS NOT CASE WHEN excluded.channel_index>0 THEN excluded.channel_index ELSE cameras.channel_index END
+            OR cameras.channel_name IS NOT CASE WHEN excluded.channel_name!='' THEN excluded.channel_name ELSE cameras.channel_name END
+            OR cameras.geo_source IS NOT CASE WHEN excluded.geo_source!='' THEN excluded.geo_source ELSE cameras.geo_source END
+            OR cameras.geo_confidence IS NOT CASE WHEN excluded.geo_confidence!='' THEN excluded.geo_confidence ELSE cameras.geo_confidence END
+            OR cameras.deleted != 0
+            OR cameras.deleted_at IS NOT NULL
     '''
     # Refresh membership at most daily. Re-scanning unchanged files should
     # not dirty thousands of SQLite rows on every startup and inflate the WAL.
     member_sql = '''INSERT INTO discovery_members(source_path,camera_id,last_seen) VALUES (?, ?, datetime('now')) ON CONFLICT(source_path,camera_id) DO UPDATE SET last_seen=datetime('now') WHERE discovery_members.last_seen < datetime('now','-1 day')'''
-    queue_sql = '''INSERT INTO validation_queue(camera_id,priority,next_attempt,max_attempts) VALUES (?, ?, datetime('now'), ?) ON CONFLICT(camera_id) DO UPDATE SET priority=MIN(validation_queue.priority,excluded.priority),next_attempt=CASE WHEN ?=1 OR excluded.priority < validation_queue.priority THEN datetime('now') ELSE validation_queue.next_attempt END,max_attempts=MIN(validation_queue.max_attempts,excluded.max_attempts)'''
+    queue_sql = '''INSERT INTO validation_queue(camera_id,priority,next_attempt,max_attempts)
+        VALUES (?, ?, datetime('now'), ?)
+        ON CONFLICT(camera_id) DO UPDATE SET
+            priority=MIN(validation_queue.priority,excluded.priority),
+            next_attempt=CASE WHEN ?=1 OR excluded.priority < validation_queue.priority
+                              THEN datetime('now') ELSE validation_queue.next_attempt END,
+            max_attempts=MIN(validation_queue.max_attempts,excluded.max_attempts)
+        WHERE validation_queue.priority != MIN(validation_queue.priority,excluded.priority)
+           OR validation_queue.max_attempts != MIN(validation_queue.max_attempts,excluded.max_attempts)
+           OR ?=1
+           OR excluded.priority < validation_queue.priority'''
     # v136: commit each small discovery chunk independently.
     for pos in range(0, len(rows), chunk_size):
         end=min(pos+chunk_size,len(rows))
@@ -4202,7 +4237,10 @@ def db_bulk_upsert(cameras: list[dict]) -> int:
             c.executemany(upsert_sql,rows[pos:end])
             member_chunk=[x for x in memberships[pos:end] if x]
             if member_chunk: c.executemany(member_sql,member_chunk)
-            if queued: c.executemany(queue_sql,queued[pos:end])
+            if queued:
+                queue_chunk = [(cid, priority, max_attempts, has_new, has_new)
+                               for cid, priority, max_attempts, has_new in queued[pos:end]]
+                c.executemany(queue_sql, queue_chunk)
             c.commit(); return end-pos
         _db_retry_write(_write_chunk,'bulk camera upsert')
         if end < len(rows): _shutdown_requested.wait(0.35 if _db_ui_recent() else 0.12)
