@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v218.0 — Discovery Feed Merge Fix
+Camera Dashboard v220.0 — Resource-Aware Validation
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -198,7 +198,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '218.0'
+VERSION = '220.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -437,16 +437,23 @@ _WORKER_STATE = {
 
 
 def _resource_snapshot() -> dict:
+    """Return host/container-aware CPU and memory measurements.
+
+    On hosted platforms, psutil can report the host's memory rather than the
+    container's actual limit. Respect cgroup v2/v1 limits when available so
+    validation does not size its worker pool against memory it cannot use.
+    """
     cpu = max(1, int(os.cpu_count() or 1))
     total = avail = 0
-    # Prefer psutil if already installed; never require another dependency.
+    load1 = 0.0
+
+    # Host-level measurements first; fall back to Linux procfs if psutil is absent.
     try:
         import psutil  # type: ignore
         vm = psutil.virtual_memory()
         total, avail = int(vm.total), int(vm.available)
         load1 = float(psutil.getloadavg()[0]) if hasattr(psutil, 'getloadavg') else 0.0
     except Exception:
-        load1 = 0.0
         try:
             if sys.platform.startswith('linux'):
                 mem = Path('/proc/meminfo').read_text(errors='ignore')
@@ -459,58 +466,89 @@ def _resource_snapshot() -> dict:
                 if hasattr(os, 'getloadavg'):
                     load1 = float(os.getloadavg()[0])
             else:
-                total = int(getattr(os, 'sysconf', lambda *_: 0)('SC_PAGE_SIZE') *
-                            getattr(os, 'sysconf', lambda *_: 0)('SC_PHYS_PAGES'))
+                page_size = int(os.sysconf('SC_PAGE_SIZE'))
+                pages = int(os.sysconf('SC_PHYS_PAGES'))
+                total = page_size * pages
                 avail = total
         except Exception:
             pass
+
+    # cgroup v2, then cgroup v1. Ignore "max" and implausible values.
+    if sys.platform.startswith('linux'):
+        cgroup_candidates = (
+            ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.current'),
+            ('/sys/fs/cgroup/memory/memory.limit_in_bytes',
+             '/sys/fs/cgroup/memory/memory.usage_in_bytes'),
+        )
+        for limit_path, current_path in cgroup_candidates:
+            try:
+                limit_raw = Path(limit_path).read_text().strip()
+                current_raw = Path(current_path).read_text().strip()
+                if limit_raw.lower() == 'max':
+                    continue
+                limit = int(limit_raw)
+                current = max(0, int(current_raw))
+                # Some cgroup v1 hosts expose a huge sentinel instead of a real limit.
+                if limit <= 0 or limit >= (1 << 60):
+                    continue
+                total = min(total or limit, limit)
+                cgroup_avail = max(0, limit - current)
+                avail = min(avail or cgroup_avail, cgroup_avail)
+                break
+            except (OSError, ValueError, TypeError):
+                continue
+
     if not total:
         total = max(avail, 512 * 1024 * 1024)
     if not avail:
         avail = total
+    avail = min(avail, total)
     return {
         'cpu_count': cpu,
         'ram_total_gb': round(total / (1024 ** 3), 2),
         'ram_available_gb': round(avail / (1024 ** 3), 2),
-        'load1': round(load1, 2),
+        'load1': round(max(0.0, load1), 2),
     }
 
 
 def _auto_validation_workers() -> int:
+    """Dynamically size camera checks from available CPU and RAM.
+
+    Recalculated before every queue batch. Automatic mode reserves memory for
+    Flask, SQLite, FFmpeg and the operating system, then budgets roughly 768 MiB
+    per concurrent validation worker. CAMERA_WORKERS=<integer> remains an
+    explicit operator override; CAMERA_WORKERS=auto (default) uses this policy.
+    """
     snap = _resource_snapshot()
-    mode = _WORKER_STATE.get('mode', 'auto')
-    # Explicit --workers/CAMERA_WORKERS is now respected up to 64.  Only
-    # automatic mode applies the conservative CPU/RAM budget.  This lets a
-    # user deliberately run 16/32/60 workers on a stronger machine while the
-    # safe default remains conservative on a 4-vCPU Replit VM.
+    mode = str(_WORKER_STATE.get('mode', 'auto') or 'auto').strip().lower()
     MAX_VALIDATION_WORKERS = 64
     if mode.isdigit():
-        requested = max(1, min(MAX_VALIDATION_WORKERS, int(mode)))
-        workers = requested
+        workers = max(1, min(MAX_VALIDATION_WORKERS, int(mode)))
     else:
-        cpu = snap['cpu_count']
-        avail_gb = max(0.5, snap['ram_available_gb'])
-        auto_cap = min(12, max(4, cpu * 2))
-        by_ram = max(4, min(auto_cap, int((avail_gb * 1024) / 512)))
-        workers = min(auto_cap, by_ram)
-        if snap['load1'] > cpu * 0.85:
-            workers = max(2, int(workers * 0.60))
-        elif snap['load1'] > cpu * 0.65:
-            workers = max(2, int(workers * 0.75))
+        cpu = max(1, int(snap['cpu_count']))
+        avail_gb = max(0.0, float(snap['ram_available_gb']))
+        # Reserve at least 1 GiB or 20% of the detected memory, whichever is larger.
+        reserve_gb = max(1.0, float(snap['ram_total_gb']) * 0.20)
+        usable_gb = max(0.0, avail_gb - reserve_gb)
+        # Cap automatic concurrency to 12, CPU capacity and actual usable RAM.
+        cpu_cap = min(12, max(1, cpu * 2))
+        ram_cap = int((usable_gb * 1024) / 768.0)
+        workers = max(1, min(cpu_cap, ram_cap))
+        # Under memory pressure, stay at one worker; otherwise taper on CPU load.
+        if avail_gb < 1.25:
+            workers = 1
+        elif snap['load1'] > cpu * 0.90:
+            workers = max(1, int(workers * 0.50))
+        elif snap['load1'] > cpu * 0.70:
+            workers = max(1, int(workers * 0.75))
+
     workers = max(1, min(MAX_VALIDATION_WORKERS, int(workers)))
-    # An explicit --validation-batch/CAMERA_VALIDATION_BATCH is a HARD QUEUE
-    # CLAIM LIMIT and is deliberately independent of the worker count.  In
-    # particular, changing auto workers (for example 8 -> 3 under load) must
-    # never silently turn a requested batch of 100 into 30.
-    #
-    # Note: a claim can still legitimately return fewer rows when fewer than
-    # the requested number are currently eligible (next_attempt reached and
-    # lease unlocked).  The queue worker logs requested vs claimed so this is
-    # distinguishable from a configuration change.
+    # Keep queue claim size proportional to the newly calculated worker budget.
+    # Explicit batch overrides remain hard limits, as documented by the CLI.
     if VALIDATION_BATCH_OVERRIDE:
         batch = max(1, min(10000, int(VALIDATION_BATCH_OVERRIDE)))
     else:
-        batch = min(2000, max(120, workers * 10))
+        batch = min(2000, max(25, workers * 10))
     with _WORKER_LOCK:
         _WORKER_STATE.update({**snap, 'workers': workers, 'batch_limit': batch,
                               'updated': time.time()})
@@ -6207,6 +6245,13 @@ def start_validation_queue_worker(max_workers: int | None = None,
                 if _validation_queue_paused.is_set():
                     _touch_worker('validation-queue', 'waiting', 'validation paused by operator')
                     _validation_queue_restart_requested.wait(5.0)
+                    continue
+                # Avoid concurrent camera probes while inventory files are being
+                # bulk-imported. This reduces CPU/RAM pressure and SQLite write
+                # contention; the queue resumes automatically when scanning ends.
+                if _scan_state_snapshot().get('running'):
+                    _touch_worker('validation-queue', 'waiting', 'waiting for inventory scan to finish')
+                    _validation_queue_restart_requested.wait(2.0)
                     continue
                 _touch_worker('validation-queue', 'running', worker_id)
                 if _full_val_active.is_set() or val_get_progress()['running']:
@@ -16558,6 +16603,14 @@ def v64_dashboard_metrics():
 # per-camera retry state and duplicate/in-flight protection metrics.
 # ══════════════════════════════════════════════════════════════════════════════
 def _v65_queue_snapshot() -> dict:
+    """Reuse dashboard queue aggregates for two seconds to avoid repeated full-table scans.
+
+    This only caches read-only metrics; validation queue writes and claims remain live.
+    """
+    return _cached_read('v65_queue_snapshot', 2.0, _v65_queue_snapshot_uncached)
+
+
+def _v65_queue_snapshot_uncached() -> dict:
     c = _db_conn()
     now_clause = "datetime('now')"
     total = int(c.execute('SELECT COUNT(*) FROM validation_queue').fetchone()[0])
