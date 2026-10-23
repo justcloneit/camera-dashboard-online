@@ -5771,12 +5771,11 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                     continue
                 seen_ids.add(cid)
                 source_members.setdefault(source, set()).add(cid)
-                if on_batch:
-                    pending_batch.append(cam)
-                    if len(pending_batch) >= SCAN_BATCH_SIZE:
-                        flush_batch(force=True)
-                    else:
-                        flush_batch()
+                # These rows are rehydrated from SQLite only to rebuild the
+                # returned inventory and source-membership map. They came from
+                # unchanged files, so do NOT send them through on_batch again:
+                # doing so rewrites every camera and requeues validation on each
+                # scheduled scan, causing avoidable SQLite lock contention.
                 if collect:
                     cameras.append(cam)
     flush_batch(force=True)
@@ -17243,11 +17242,10 @@ def main() -> None:
 
         if _shutdown_requested.is_set():
             return
-        try:
-            start_validation_queue_worker(max_workers=None, delay=1.0)
-            log.info('[Startup] Validation queue worker started before discovery; new cameras can be checked during the scan')
-        except Exception:
-            log.exception('[Startup] Could not start early validation queue worker')
+        # Discover/import source files before starting queue validation. Starting
+        # validation concurrently with a first-time inventory import makes the
+        # validator compete with thousands of camera upserts and status writes.
+        # The HTTP server is already serving requests while this worker runs.
         log.info('Background startup: scanning %s …', _SEARCH_DIR)
         try:
             _scan_and_upsert()
@@ -17261,9 +17259,13 @@ def main() -> None:
             cameras = []
 
         if not _shutdown_requested.is_set():
-            # The persistent queue worker is the sole validation scheduler. Avoid
-            # claiming a second giant startup batch that would block newly found
-            # cameras behind a long one-shot validation cycle.
+            try:
+                start_validation_queue_worker(max_workers=None, delay=1.0)
+                log.info('[Startup] Validation queue worker started after discovery; pending cameras will be checked in the background')
+            except Exception:
+                log.exception('[Startup] Could not start validation queue worker after discovery')
+            # The persistent queue worker is the sole validation scheduler.
+            # Do not claim a second giant startup batch.
             log.info('[Startup] Persistent validation queue remains the single validation runner for pending and newly discovered cameras')
 
         # Notifications must not be allowed to make database/startup recovery fail.
