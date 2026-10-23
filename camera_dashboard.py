@@ -29,6 +29,7 @@ import select
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 import threading
 import time
 import webbrowser
@@ -3515,26 +3516,11 @@ def _sync_advanced_metadata(cam):
         def _write():
             c=_db_conn()
             c.execute('''INSERT INTO device_fingerprints(device_key,camera_id,fingerprint,vendor,model,serial,last_seen,confidence) VALUES(?,?,?,?,?,?,datetime('now'),?) ON CONFLICT(device_key) DO UPDATE SET camera_id=excluded.camera_id,fingerprint=excluded.fingerprint,vendor=excluded.vendor,model=excluded.model,serial=excluded.serial,last_seen=datetime('now'),confidence=excluded.confidence''',(key,cid,fp,_safe_str(cam.get('camera_type')),_safe_str(cam.get('label')),_safe_str(cam.get('device_id')),score))
-            # Avoid deleting/reinserting evidence rows when the camera's
-            # evidence has not changed. This reduces needless SQLite writes
-            # and lock contention during periodic metadata reconciliation.
-            desired_evidence=[]
+            c.execute('DELETE FROM device_evidence WHERE camera_id=?',(cid,))
             for item in evidence:
-                if not isinstance(item,(list,tuple)) or len(item)<3:
-                    continue
-                et,res,val=item[0],item[1],item[2]
-                conf=item[3] if len(item)>=4 else (float(val) if isinstance(val,(int,float)) else 0.0)
-                desired_evidence.append((str(et),str(res),str(val)[:500],conf))
-            desired_evidence.sort(key=lambda row: (row[0],row[1],row[2],row[3]))
-            existing_evidence=c.execute(
-                "SELECT evidence_type,result,value,confidence FROM device_evidence WHERE camera_id=? ORDER BY evidence_type,result,value,confidence",
-                (cid,)
-            ).fetchall()
-            current_evidence=[(str(row[0]),str(row[1]),str(row[2]),row[3]) for row in existing_evidence]
-            if current_evidence != desired_evidence:
-                c.execute('DELETE FROM device_evidence WHERE camera_id=?',(cid,))
-                for et,res,val,conf in desired_evidence:
-                    c.execute('INSERT INTO device_evidence(camera_id,evidence_type,result,value,confidence) VALUES(?,?,?,?,?)',(cid,et,res,val,conf))
+                if not isinstance(item,(list,tuple)) or len(item)<3: continue
+                et,res,val=item[0],item[1],item[2]; conf=item[3] if len(item)>=4 else (float(val) if isinstance(val,(int,float)) else 0.0)
+                c.execute('INSERT INTO device_evidence(camera_id,evidence_type,result,value,confidence) VALUES(?,?,?,?,?)',(cid,str(et),str(res),str(val)[:500],conf))
             c.commit()
         if _shutdown_requested.is_set():
             return False
@@ -4143,8 +4129,6 @@ _STATUS_SORT = "CASE status WHEN 'online' THEN 0 WHEN 'checking' THEN 1 WHEN 'un
 
 def db_bulk_upsert(cameras: list[dict]) -> int:
     # Bounded discovery upsert. Never build a giant SQLite IN (...) parameter list.
-    # v218 contention patch: unchanged camera/queue rows are not rewritten;
-    # this avoids refreshing updated_at and generating WAL traffic on every rescan.
     if not cameras:
         return 0
     c = _db_conn()
@@ -4192,44 +4176,11 @@ def db_bulk_upsert(cameras: list[dict]) -> int:
             geo_source=CASE WHEN excluded.geo_source!='' THEN excluded.geo_source ELSE cameras.geo_source END,
             geo_confidence=CASE WHEN excluded.geo_confidence!='' THEN excluded.geo_confidence ELSE cameras.geo_confidence END,
             deleted=0, deleted_at=NULL, updated_at=datetime('now')
-        WHERE
-            cameras.label IS NOT CASE
-                WHEN trim(COALESCE(excluded.label,''))='' OR lower(trim(excluded.label)) IN ('camera','unknown','generic','generic_rtsp','generic_rtsp_pending')
-                THEN cameras.label ELSE excluded.label END
-            OR cameras.ip IS NOT excluded.ip
-            OR cameras.port IS NOT excluded.port
-            OR cameras.camera_type IS NOT CASE WHEN excluded.camera_type!='' THEN excluded.camera_type ELSE cameras.camera_type END
-            OR cameras.username IS NOT CASE WHEN excluded.username!='' THEN excluded.username ELSE cameras.username END
-            OR cameras.password IS NOT CASE WHEN excluded.password!='' THEN excluded.password ELSE cameras.password END
-            OR cameras.country IS NOT CASE WHEN excluded.country!='' THEN excluded.country ELSE cameras.country END
-            OR cameras.region IS NOT CASE WHEN excluded.region!='' THEN excluded.region ELSE cameras.region END
-            OR cameras.city IS NOT CASE WHEN excluded.city!='' THEN excluded.city ELSE cameras.city END
-            OR cameras.rtsp_urls IS NOT CASE WHEN excluded.rtsp_urls!='[]' THEN excluded.rtsp_urls ELSE cameras.rtsp_urls END
-            OR cameras.web_url IS NOT CASE WHEN excluded.web_url!='' THEN excluded.web_url ELSE cameras.web_url END
-            OR cameras.source_file IS NOT excluded.source_file
-            OR cameras.group_name IS NOT excluded.group_name
-            OR cameras.device_id IS NOT CASE WHEN excluded.device_id!='' THEN excluded.device_id ELSE cameras.device_id END
-            OR cameras.channel_index IS NOT CASE WHEN excluded.channel_index>0 THEN excluded.channel_index ELSE cameras.channel_index END
-            OR cameras.channel_name IS NOT CASE WHEN excluded.channel_name!='' THEN excluded.channel_name ELSE cameras.channel_name END
-            OR cameras.geo_source IS NOT CASE WHEN excluded.geo_source!='' THEN excluded.geo_source ELSE cameras.geo_source END
-            OR cameras.geo_confidence IS NOT CASE WHEN excluded.geo_confidence!='' THEN excluded.geo_confidence ELSE cameras.geo_confidence END
-            OR cameras.deleted != 0
-            OR cameras.deleted_at IS NOT NULL
     '''
     # Refresh membership at most daily. Re-scanning unchanged files should
     # not dirty thousands of SQLite rows on every startup and inflate the WAL.
     member_sql = '''INSERT INTO discovery_members(source_path,camera_id,last_seen) VALUES (?, ?, datetime('now')) ON CONFLICT(source_path,camera_id) DO UPDATE SET last_seen=datetime('now') WHERE discovery_members.last_seen < datetime('now','-1 day')'''
-    queue_sql = '''INSERT INTO validation_queue(camera_id,priority,next_attempt,max_attempts)
-        VALUES (?, ?, datetime('now'), ?)
-        ON CONFLICT(camera_id) DO UPDATE SET
-            priority=MIN(validation_queue.priority,excluded.priority),
-            next_attempt=CASE WHEN ?=1 OR excluded.priority < validation_queue.priority
-                              THEN datetime('now') ELSE validation_queue.next_attempt END,
-            max_attempts=MIN(validation_queue.max_attempts,excluded.max_attempts)
-        WHERE validation_queue.priority != MIN(validation_queue.priority,excluded.priority)
-           OR validation_queue.max_attempts != MIN(validation_queue.max_attempts,excluded.max_attempts)
-           OR ?=1
-           OR excluded.priority < validation_queue.priority'''
+    queue_sql = '''INSERT INTO validation_queue(camera_id,priority,next_attempt,max_attempts) VALUES (?, ?, datetime('now'), ?) ON CONFLICT(camera_id) DO UPDATE SET priority=MIN(validation_queue.priority,excluded.priority),next_attempt=CASE WHEN ?=1 OR excluded.priority < validation_queue.priority THEN datetime('now') ELSE validation_queue.next_attempt END,max_attempts=MIN(validation_queue.max_attempts,excluded.max_attempts)'''
     # v136: commit each small discovery chunk independently.
     for pos in range(0, len(rows), chunk_size):
         end=min(pos+chunk_size,len(rows))
@@ -4237,10 +4188,7 @@ def db_bulk_upsert(cameras: list[dict]) -> int:
             c.executemany(upsert_sql,rows[pos:end])
             member_chunk=[x for x in memberships[pos:end] if x]
             if member_chunk: c.executemany(member_sql,member_chunk)
-            if queued:
-                queue_chunk = [(cid, priority, max_attempts, has_new, has_new)
-                               for cid, priority, max_attempts, has_new in queued[pos:end]]
-                c.executemany(queue_sql, queue_chunk)
+            if queued: c.executemany(queue_sql,queued[pos:end])
             c.commit(); return end-pos
         _db_retry_write(_write_chunk,'bulk camera upsert')
         if end < len(rows): _shutdown_requested.wait(0.35 if _db_ui_recent() else 0.12)
@@ -16936,6 +16884,97 @@ def v111_regression_selftest():
     return {'ok':not errors,'errors':errors}
 
 
+def _export_favorites_security_db(source_db: str, destination_db: str, source_script: str) -> None:
+    """Create a fresh-schema DB containing only Favorites and user/security config."""
+    import tempfile, importlib.util
+    src_path = os.path.abspath(source_db)
+    dst_path = os.path.abspath(destination_db)
+    if not os.path.isfile(src_path) or os.path.getsize(src_path) <= 0:
+        raise RuntimeError(f'Source database is missing or empty: {src_path}')
+    if os.path.exists(dst_path):
+        raise RuntimeError(f'Refusing to overwrite existing destination database: {dst_path}')
+    os.makedirs(os.path.dirname(dst_path) or '.', exist_ok=True)
+    uri = Path(src_path).resolve().as_uri() + '?mode=ro'
+    src = sqlite3.connect(uri, uri=True, timeout=30)
+    src.row_factory = sqlite3.Row
+    src.execute('PRAGMA query_only=ON')
+    try:
+        check = src.execute('PRAGMA quick_check').fetchone()[0]
+        if check != 'ok':
+            raise RuntimeError(f'Source database integrity check failed: {check}')
+        if not src.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cameras'").fetchone():
+            raise RuntimeError('Source database does not contain the cameras table.')
+        cam_cols = {r[1] for r in src.execute('PRAGMA table_info(cameras)')}
+        if not {'favorite','deleted'}.issubset(cam_cols):
+            raise RuntimeError('Source cameras table lacks favorite/deleted fields; refusing an unsafe migration.')
+        favorite_count = src.execute('SELECT COUNT(*) FROM cameras WHERE favorite=1 AND COALESCE(deleted,0)=0').fetchone()[0]
+        config_tables = ('v43_auth_users','v43_user_roles','v43_user_access_scope','app_settings','api_keys','alert_rules','scheduled_jobs','app_retention')
+        with tempfile.TemporaryDirectory(prefix='camera-dashboard-fav-export-') as td:
+            old_data_dir = os.environ.get('CAMERA_DATA_DIR')
+            os.environ['CAMERA_DATA_DIR'] = td
+            try:
+                spec = importlib.util.spec_from_file_location('_camera_dashboard_fresh_schema', os.path.abspath(source_script))
+                if spec is None or spec.loader is None:
+                    raise RuntimeError('Unable to load this dashboard script to initialize the new schema.')
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                module.db_init(allow_create_if_missing=True)
+                try:
+                    module._db_conn().close()
+                except Exception:
+                    pass
+                fresh_path = os.path.join(td, 'camera_db.sqlite')
+                dst = sqlite3.connect(fresh_path, timeout=30)
+                dst.row_factory = sqlite3.Row
+                try:
+                    dst.execute('PRAGMA journal_mode=DELETE')
+                    dst.execute('BEGIN IMMEDIATE')
+                    def copy_table(table, where=None):
+                        src_exists = src.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                        dst_exists = dst.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                        if not src_exists or not dst_exists:
+                            print(f'  {table}: skipped (not present in both schemas)')
+                            return
+                        sc = [r[1] for r in src.execute(f'PRAGMA table_info("{table}")')]
+                        dc = {r[1] for r in dst.execute(f'PRAGMA table_info("{table}")')}
+                        cols = [c for c in sc if c in dc]
+                        if not cols:
+                            return
+                        sql = 'SELECT '+','.join('"'+c+'"' for c in cols)+f' FROM "{table}"'
+                        if where: sql += ' WHERE '+where
+                        rows = src.execute(sql).fetchall()
+                        if rows:
+                            ins = f'INSERT INTO "{table}" ('+','.join('"'+c+'"' for c in cols)+') VALUES ('+','.join('?' for _ in cols)+')'
+                            dst.executemany(ins, [tuple(row[c] for c in cols) for row in rows])
+                        print(f'  {table}: copied {len(rows)} row(s)')
+                    copy_table('cameras', 'favorite=1 AND COALESCE(deleted,0)=0')
+                    for table in config_tables:
+                        copy_table(table)
+                    dst.commit()
+                    fk = dst.execute('PRAGMA foreign_key_check').fetchall()
+                    integrity = dst.execute('PRAGMA quick_check').fetchone()[0]
+                    if fk or integrity != 'ok':
+                        raise RuntimeError(f'New database validation failed: quick_check={integrity}, foreign_key_errors={len(fk)}')
+                except Exception:
+                    dst.rollback()
+                    raise
+                finally:
+                    dst.close()
+                # Publish only after validation; never overwrite an existing file.
+                if os.path.exists(dst_path):
+                    raise RuntimeError(f'Destination appeared during export; refusing to overwrite: {dst_path}')
+                shutil.copy2(fresh_path, dst_path)
+            finally:
+                if old_data_dir is None: os.environ.pop('CAMERA_DATA_DIR', None)
+                else: os.environ['CAMERA_DATA_DIR'] = old_data_dir
+        print(f'Export complete: {dst_path}')
+        print(f'Favorite cameras copied: {favorite_count}')
+        print('User/security settings copied where compatible. Bulk history, discovery evidence, and validation queues were not copied.')
+    finally:
+        src.close()
+
+
 def main() -> None:
     global _SEARCH_DIR, MAX_STREAMS, VALIDATION_BATCH_OVERRIDE, DATA_DIR, SNAPSHOT_DIR, LOG_DIR, DB_PATH, DB_BACKUPS, DB_BACKUP_GLOB_PREFIX, TG_CONFIG, RTSP_SAVE
 
@@ -16970,7 +17009,15 @@ def main() -> None:
                         help='Disable automatic import of camera_dashboard_user_config.sqlite when present in --data-dir.')
     parser.add_argument('--create-db-if-missing', action='store_true',
                         help='Create a fresh SQLite database only when the live DB is missing and no verified backup exists; never replace a corrupt existing DB.')
+    parser.add_argument('--export-favorites-db', metavar='PATH',
+                        help='Create a separate fresh-schema SQLite DB containing Favorites plus compatible users/security settings, then exit without starting the server.')
     args = parser.parse_args()
+    if args.export_favorites_db:
+        export_data_dir = os.path.abspath(args.data_dir)
+        export_source_db = os.path.join(export_data_dir, 'camera_db.sqlite')
+        # Respect an explicitly located legacy DB only when the normal startup would adopt it.
+        _export_favorites_security_db(export_source_db, args.export_favorites_db, __file__)
+        return
     # A deployment Start Command may explicitly contain --host 127.0.0.1 from
     # an older configuration. On hosted platforms, correct that unsafe binding
     # automatically so the deployment remains reachable without editing each
@@ -17026,10 +17073,23 @@ def main() -> None:
     # explicitly requests --create-db-if-missing, however, keep the requested
     # data directory authoritative so a missing DB is created fresh instead of
     # silently adopting an old legacy DB or backup.
-    if not args.create_db_if_missing:
-        _adopt_legacy_database_path_if_needed()
-    else:
+    # If the configured live DB is missing, the default is a fresh database.
+    # Do not silently adopt a legacy DB or backup from another path: the user
+    # explicitly requested that missing-DB startup create a clean database.
+    # The old database/backup files are left untouched and can still be used
+    # explicitly with --export-favorites-db when the source DB exists.
+    live_db_missing = (not os.path.isfile(DB_PATH) or os.path.getsize(DB_PATH) <= 0)
+    if args.create_db_if_missing:
         log.info('[DB Compatibility] --create-db-if-missing active; legacy DB/backup adoption is disabled for this startup.')
+    elif live_db_missing:
+        log.info('[DB Compatibility] Live DB is missing; skipping legacy DB/backup adoption and creating a fresh database by default.')
+    else:
+        _adopt_legacy_database_path_if_needed()
+    # Default behavior: missing/empty DB means fresh schema. Existing/corrupt
+    # databases are never overwritten by this branch.
+    if not os.path.isfile(DB_PATH) or os.path.getsize(DB_PATH) <= 0:
+        log.warning('[DB Protection] Live DB is missing/empty; defaulting to fresh DB initialization at %s', DB_PATH)
+        args.create_db_if_missing = True
     # Rebind the clean-shutdown marker after any legacy DB adoption so the marker
     # always follows the actual live database path.
     CLEAN_SHUTDOWN_MARKER = DB_PATH + '.clean_shutdown.json'
