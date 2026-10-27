@@ -198,7 +198,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '220.0'
+VERSION = '221.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -4436,46 +4436,87 @@ def db_soft_delete(cam_id: str) -> None:
 
 
 def db_reconcile_source(source_file: str, found_ids: set[str]) -> int:
-    """Remove stale source membership and soft-delete orphaned cameras.
-
-    Membership tracking avoids deleting a camera still present in another
-    playlist. Older imported records without membership rows use a
-    conservative source_file fallback.
-    """
+    """Reconcile one source in bounded chunks and avoid destructive empty scans."""
     if not source_file:
         return 0
-    c = _db_conn()
-    known = {r[0] for r in c.execute(
-        'SELECT camera_id FROM discovery_members WHERE source_path=?',
-        (source_file,)).fetchall()}
-    if not known:
-        known = {r[0] for r in c.execute(
-            'SELECT id FROM cameras WHERE deleted=0 AND source_file=?',
-            (source_file,)).fetchall()}
-    stale = known - set(found_ids)
-    if not stale:
-        return 0
-    ph = ','.join('?' * len(stale))
-    c.execute(f'DELETE FROM discovery_members WHERE source_path=? AND camera_id IN ({ph})',
-              [source_file, *stale])
-    orphaned = [r[0] for r in c.execute(f'''
-        SELECT id FROM cameras
-        WHERE id IN ({ph}) AND NOT EXISTS (
-            SELECT 1 FROM discovery_members m WHERE m.camera_id=cameras.id
+
+    # Empty results can mean a transient/partial parse. Preserve existing rows.
+    found_ids = {str(value) for value in (found_ids or set()) if str(value)}
+    if not found_ids:
+        log.warning(
+            'Discovery reconciliation skipped for %s: no camera IDs were found; '
+            'existing memberships/cameras were preserved.',
+            source_file,
         )
-    ''', list(stale)).fetchall()]
+        return 0
+
+    c = _db_conn()
+    known = {
+        r[0] for r in c.execute(
+            'SELECT camera_id FROM discovery_members WHERE source_path=?',
+            (source_file,),
+        ).fetchall()
+    }
+    if not known:
+        known = {
+            r[0] for r in c.execute(
+                'SELECT id FROM cameras WHERE deleted=0 AND source_file=?',
+                (source_file,),
+            ).fetchall()
+        }
+
+    stale_list = list(known - found_ids)
+    if not stale_list:
+        return 0
+
+    # Stay below SQLite's common 999-bind-variable limit.
+    chunk_size = 400
+    orphaned = []
+    try:
+        c.execute('BEGIN')
+        for offset in range(0, len(stale_list), chunk_size):
+            chunk = stale_list[offset:offset + chunk_size]
+            placeholders = ','.join('?' for _ in chunk)
+            c.execute(
+                f'DELETE FROM discovery_members '
+                f'WHERE source_path=? AND camera_id IN ({placeholders})',
+                [source_file, *chunk],
+            )
+
+        # Only soft-delete stale cameras that have no remaining source membership.
+        for offset in range(0, len(stale_list), chunk_size):
+            chunk = stale_list[offset:offset + chunk_size]
+            placeholders = ','.join('?' for _ in chunk)
+            rows = c.execute(
+                f'SELECT id FROM cameras WHERE id IN ({placeholders}) '
+                'AND NOT EXISTS (SELECT 1 FROM discovery_members m '
+                'WHERE m.camera_id=cameras.id)',
+                chunk,
+            ).fetchall()
+            orphaned.extend(row[0] for row in rows)
+
+        for offset in range(0, len(orphaned), chunk_size):
+            chunk = orphaned[offset:offset + chunk_size]
+            placeholders = ','.join('?' for _ in chunk)
+            c.execute(
+                f"UPDATE cameras SET deleted=1, deleted_at=datetime('now'), "
+                f"updated_at=datetime('now') WHERE id IN ({placeholders}) AND deleted=0",
+                chunk,
+            )
+            c.execute(
+                f'DELETE FROM validation_queue WHERE camera_id IN ({placeholders})',
+                chunk,
+            )
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+
     if orphaned:
-        oph = ','.join('?' * len(orphaned))
-        c.execute(f"""
-            UPDATE cameras SET deleted=1,deleted_at=datetime('now'),
-                   updated_at=datetime('now')
-            WHERE id IN ({oph})
-        """, orphaned)
-        c.execute(f'DELETE FROM validation_queue WHERE camera_id IN ({oph})', orphaned)
-    c.commit()
-    if orphaned:
-        log.info('Discovery cleanup: soft-deleted %d stale cameras from %s',
-                 len(orphaned), source_file)
+        log.info(
+            'Discovery cleanup: soft-deleted %d stale cameras from %s',
+            len(orphaned), source_file,
+        )
     return len(orphaned)
 
 
