@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v227.0 — Resource-Aware Validation
+Camera Dashboard v228.0 — Resource-Aware Validation
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -198,7 +198,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '227.0'
+VERSION = '228.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -5864,6 +5864,8 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
     # source-membership map from discovery_members JOIN cameras. This is a
     # read-only rehydration path: it does NOT rewrite cameras, memberships, or
     # validation_queue and therefore does not add SQLite writer contention.
+    rehydrated_ids: set[str] = set()
+    rehydrated_source_members = 0
     if current_sources:
         source_list = sorted(current_sources)
         for start in range(0, len(source_list), 400):
@@ -5897,6 +5899,8 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                 # Always restore the complete source membership, even when the
                 # camera was already rehydrated from another source.
                 source_members.setdefault(discovery_source, set()).add(cid)
+                rehydrated_source_members += 1
+                rehydrated_ids.add(cid)
 
                 if cid in seen_ids:
                     continue
@@ -5908,12 +5912,55 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                 if collect:
                     cameras.append(cam)
 
+        # SAFETY FALLBACK: older databases may contain cameras.source_file but
+        # have an empty/partial discovery_members table. Rebuild the in-memory
+        # source membership from the authoritative camera row without parsing
+        # unchanged files and without deleting or rewriting any camera.
+        # This is intentionally read-only.
+        try:
+            fallback_rows = []
+            for start in range(0, len(source_list), 400):
+                chunk = source_list[start:start + 400]
+                ph = ','.join('?' * len(chunk))
+                fallback_rows.extend(_db_conn().execute(
+                    f'''
+                    SELECT c.*
+                    FROM cameras c
+                    WHERE c.deleted=0 AND c.source_file IN ({ph})
+                    ORDER BY c.source_file, c.id
+                    ''',
+                    chunk,
+                ).fetchall())
+
+            fallback_recovered = 0
+            for row in fallback_rows:
+                cam = _db_row(row)
+                cid = str(cam.get('id') or '')
+                source_file = str(cam.get('source_file') or '')
+                if not cid or source_file not in current_sources:
+                    continue
+                source_members.setdefault(source_file, set()).add(cid)
+                if cid in rehydrated_ids:
+                    continue
+                rehydrated_ids.add(cid)
+                fallback_recovered += 1
+                if collect:
+                    cameras.append(cam)
+            if fallback_rows:
+                log.info(
+                    '[Scanner] Rehydration fallback checked cameras.source_file: rows=%d recovered=%d',
+                    len(fallback_rows), fallback_recovered
+                )
+        except sqlite3.Error as exc:
+            log.warning('Discovery source_file fallback query failed: %s', exc)
+
     flush_batch(force=True)
     _last_discovery_members = source_members
     log.info(
         'Discovery: rehydrated=%d cameras from SQLite across %d current sources%s; '
-        'unchanged sources were not rewritten',
-        len(cameras), len(current_sources), ' (forced)' if force else ''
+        'source_memberships=%d; unchanged sources were not rewritten',
+        len(rehydrated_ids), len(current_sources), ' (forced)' if force else '',
+        rehydrated_source_members
     )
     return cameras
 
