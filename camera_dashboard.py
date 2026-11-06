@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v220.0 — Resource-Aware Validation
+Camera Dashboard v224.0 — Resource-Aware Validation
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -198,7 +198,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '223.0'
+VERSION = '224.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
