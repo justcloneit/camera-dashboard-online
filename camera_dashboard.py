@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v224.0 — Resource-Aware Validation
+Camera Dashboard v225.0 — Resource-Aware Validation
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
@@ -198,7 +198,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '224.0'
+VERSION = '225.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -335,7 +335,7 @@ ADVANCED_HEALTH_INTERVAL = max(15, int(os.getenv('CAMERA_HEALTH_INTERVAL_SECONDS
 
 STREAM_RECOVERY_ATTEMPTS = max(0, min(2, int(os.getenv('CAMERA_STREAM_RECOVERY_ATTEMPTS', '1'))))
 STREAM_MAX_ATTEMPTS = max(4, min(32, int(os.getenv('CAMERA_STREAM_MAX_ATTEMPTS', '24'))))
-VALIDATION_PROBE_CONCURRENCY = max(1, min(64, int(os.getenv('CAMERA_VALIDATION_PROBE_CONCURRENCY', '8'))))
+VALIDATION_PROBE_CONCURRENCY = max(1, min(256, int(os.getenv('CAMERA_VALIDATION_PROBE_CONCURRENCY', '32'))))
 STREAM_MAX_WIDTH = max(0, min(3840, int(os.getenv('CAMERA_STREAM_MAX_WIDTH', '1280'))))
 STREAM_MAX_BUFFER = max(4 * 1024 * 1024, int(os.getenv('CAMERA_STREAM_MAX_BUFFER', str(16 * 1024 * 1024))))
 RTSP_API_TOKEN = os.getenv('CAMERA_RTSP_API_TOKEN', '').strip()
@@ -521,26 +521,37 @@ def _auto_validation_workers() -> int:
     """
     snap = _resource_snapshot()
     mode = str(_WORKER_STATE.get('mode', 'auto') or 'auto').strip().lower()
-    MAX_VALIDATION_WORKERS = 64
+    # v225: the previous 64-worker ceiling was an artificial bottleneck on
+    # dedicated/high-core machines. Validation is primarily network/FFmpeg I/O,
+    # so allow substantially higher explicit and automatic concurrency while
+    # still bounding it by CPU, available memory, and operator override.
+    MAX_VALIDATION_WORKERS = max(64, min(512, int(os.getenv('CAMERA_MAX_WORKERS', '512'))))
     if mode.isdigit():
         workers = max(1, min(MAX_VALIDATION_WORKERS, int(mode)))
     else:
         cpu = max(1, int(snap['cpu_count']))
         avail_gb = max(0.0, float(snap['ram_available_gb']))
-        # Reserve at least 1 GiB or 20% of the detected memory, whichever is larger.
-        reserve_gb = max(1.0, float(snap['ram_total_gb']) * 0.20)
+        total_gb = max(0.0, float(snap['ram_total_gb']))
+        # Reserve enough memory for Flask, SQLite, OS page cache and FFmpeg
+        # processes. Large servers therefore scale much higher than v224.
+        reserve_gb = max(2.0, total_gb * 0.15)
         usable_gb = max(0.0, avail_gb - reserve_gb)
-        # Cap automatic concurrency to 12, CPU capacity and actual usable RAM.
-        cpu_cap = min(12, max(1, cpu * 2))
-        ram_cap = int((usable_gb * 1024) / 768.0)
+        # Network/FFmpeg validation benefits from oversubscribing CPU. The
+        # default 8x CPU ceiling is intentionally bounded by MAX_WORKERS.
+        cpu_cap = min(MAX_VALIDATION_WORKERS, max(4, cpu * 8))
+        # Budget about 384 MiB per concurrent validator. This is a conservative
+        # guard because ffprobe subprocesses and response buffers are external.
+        ram_cap = max(1, int((usable_gb * 1024) / 384.0))
         workers = max(1, min(cpu_cap, ram_cap))
-        # Under memory pressure, stay at one worker; otherwise taper on CPU load.
-        if avail_gb < 1.25:
+        # Taper only when the machine is genuinely saturated.
+        if avail_gb < 1.0:
             workers = 1
-        elif snap['load1'] > cpu * 0.90:
+        elif snap['load1'] > cpu * 1.25:
             workers = max(1, int(workers * 0.50))
-        elif snap['load1'] > cpu * 0.70:
-            workers = max(1, int(workers * 0.75))
+        elif snap['load1'] > cpu * 1.00:
+            workers = max(1, int(workers * 0.70))
+        elif snap['load1'] > cpu * 0.85:
+            workers = max(1, int(workers * 0.85))
 
     workers = max(1, min(MAX_VALIDATION_WORKERS, int(workers)))
     # Keep queue claim size proportional to the newly calculated worker budget.
@@ -548,7 +559,7 @@ def _auto_validation_workers() -> int:
     if VALIDATION_BATCH_OVERRIDE:
         batch = max(1, min(10000, int(VALIDATION_BATCH_OVERRIDE)))
     else:
-        batch = min(2000, max(25, workers * 10))
+        batch = min(10000, max(50, workers * 12))
     with _WORKER_LOCK:
         _WORKER_STATE.update({**snap, 'workers': workers, 'batch_limit': batch,
                               'updated': time.time()})
@@ -558,7 +569,7 @@ def _auto_validation_workers() -> int:
 def _validation_worker_config() -> tuple[int, int]:
     workers = _auto_validation_workers()
     with _WORKER_LOCK:
-        return workers, int(_WORKER_STATE.get('batch_limit') or min(2000, max(100, workers * 10)))
+        return workers, int(_WORKER_STATE.get('batch_limit') or min(10000, max(100, workers * 12)))
 
 
 # Directories / files to skip during discovery
@@ -2810,9 +2821,10 @@ def _db_conn() -> sqlite3.Connection:
         # half a minute before our retry logic even got a chance to run.
         c.execute('PRAGMA journal_mode=WAL')
         c.execute('PRAGMA synchronous=NORMAL')
-        c.execute('PRAGMA busy_timeout=2000')
-        c.execute('PRAGMA wal_autocheckpoint=1000')
-        c.execute('PRAGMA cache_size=-16384')
+        c.execute("PRAGMA busy_timeout=5000")
+        c.execute("PRAGMA wal_autocheckpoint=4000")
+        # ~64 MiB page cache per connection; SQLite will reclaim it under pressure.
+        c.execute("PRAGMA cache_size=-65536")
         c.execute('PRAGMA temp_store=MEMORY')
         c.row_factory = sqlite3.Row
         _db_local.conn = c
@@ -6267,8 +6279,8 @@ def start_validation_queue_worker(max_workers: int | None = None,
         initial_workers, initial_batch_limit = _validation_worker_config()
     else:
         initial_workers = max_workers
-        initial_workers = min(64, max(1, int(max_workers)))
-        initial_batch_limit = (VALIDATION_BATCH_OVERRIDE or min(2000, max(120, initial_workers * 10)))
+        initial_workers = min(max(64, min(512, int(os.getenv('CAMERA_MAX_WORKERS', '512')))), max(1, int(max_workers)))
+        initial_batch_limit = (VALIDATION_BATCH_OVERRIDE or min(10000, max(120, initial_workers * 12)))
     worker_id = f'validation-queue-{os.getpid()}-{uuid.uuid4().hex[:8]}'
 
     def _run():
@@ -17115,7 +17127,7 @@ def main() -> None:
     parser.add_argument('--data-dir', default=os.getenv('CAMERA_DATA_DIR', DATA_DIR), help='Runtime data directory for DB/logs/backups/snapshots/config')
     parser.add_argument('--no-browser', action='store_true', help='Do not auto-open browser')
     parser.add_argument('--workers', default=os.getenv('CAMERA_WORKERS', 'auto'),
-                        help='Validation workers: auto or 1-64 (default: auto; explicit value is respected)')
+                        help='Validation workers: auto or 1-512 (default: auto; explicit value is respected)')
     parser.add_argument('--validation-batch', type=int, default=VALIDATION_BATCH_OVERRIDE,
                         help='Validation queue batch size: 0=automatic, 1-10000')
     parser.add_argument('--max-streams', type=int, default=MAX_STREAMS,
@@ -17157,8 +17169,9 @@ def main() -> None:
 
     worker_arg = str(args.workers).strip().lower()
     if worker_arg != 'auto':
-        if not worker_arg.isdigit() or not 1 <= int(worker_arg) <= 64:
-            parser.error('--workers must be auto or an integer from 1 to 64')
+        max_workers_cli = max(64, min(512, int(os.getenv('CAMERA_MAX_WORKERS', '512'))))
+        if not worker_arg.isdigit() or not 1 <= int(worker_arg) <= max_workers_cli:
+            parser.error(f'--workers must be auto or an integer from 1 to {max_workers_cli}')
     if not 0 <= int(args.validation_batch) <= 10000:
         parser.error('--validation-batch must be between 0 and 10000')
     if not 1 <= int(args.max_streams) <= 256:
@@ -17168,9 +17181,9 @@ def main() -> None:
     _WORKER_STATE['mode'] = worker_arg
     startup_workers, startup_batch = _validation_worker_config()
     snap = _resource_snapshot()
-    log.info('[Resources] mode=%s cpu=%d RAM=%.2fGB available=%.2fGB load1=%.2f -> effective_workers=%d queue_batch=%d',
+    log.info('[Resources] mode=%s cpu=%d RAM=%.2fGB available=%.2fGB load1=%.2f -> effective_workers=%d queue_batch=%d probe_concurrency=%d max_workers=%s',
              worker_arg, snap['cpu_count'], snap['ram_total_gb'], snap['ram_available_gb'],
-             snap['load1'], startup_workers, startup_batch)
+             snap['load1'], startup_workers, startup_batch, VALIDATION_PROBE_CONCURRENCY, os.getenv('CAMERA_MAX_WORKERS','512'))
 
     os.umask(0o077)
     DATA_DIR=os.path.abspath(args.data_dir); os.makedirs(DATA_DIR,exist_ok=True)
