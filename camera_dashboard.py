@@ -198,7 +198,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '226.0'
+VERSION = '227.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -5847,11 +5847,23 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
                 [os.path.abspath(row['path']), str(root)]) == str(root):
             source_members.setdefault(row['path'], set())
     _db_conn().commit()
-    # Rehydrate unchanged source files from SQLite. The previous implementation
-    # correctly skipped unchanged files for speed, but then returned only records
-    # parsed during this invocation. After a restart that produced the misleading
-    # "Discovery: found 0 cameras" even though the DB already contained them.
-    # Keep the fast stat/mtime skip while restoring the current inventory from DB.
+    # Rehydrate unchanged source files from SQLite.
+    #
+    # IMPORTANT: source_file on the cameras row is NOT a reliable membership
+    # index when the same camera exists in multiple playlists/source files:
+    # db_bulk_upsert() intentionally keeps one source_file value on the camera
+    # while discovery_members stores the complete source -> camera mapping.
+    # Querying cameras.source_file here therefore returned zero cameras after
+    # restart even though discovery_members and validation_queue still had the
+    # correct inventory. That produced the misleading:
+    #   Discovery: parsed=0 cameras
+    #   records_seen=0 processed=0
+    # and then emitted one "no camera IDs" warning for every unchanged file.
+    #
+    # Keep the fast stat/mtime skip, but rebuild the current inventory and
+    # source-membership map from discovery_members JOIN cameras. This is a
+    # read-only rehydration path: it does NOT rewrite cameras, memberships, or
+    # validation_queue and therefore does not add SQLite writer contention.
     if current_sources:
         source_list = sorted(current_sources)
         for start in range(0, len(source_list), 400):
@@ -5859,31 +5871,50 @@ def find_all_cameras(search_dir: str, force: bool = False, on_batch=None, collec
             ph = ','.join('?' * len(chunk))
             try:
                 rows = _db_conn().execute(
-                    f'SELECT * FROM cameras WHERE deleted=0 AND source_file IN ({ph})',
-                    chunk).fetchall()
-            except sqlite3.Error:
+                    f'''
+                    SELECT m.source_path AS discovery_source, c.*
+                    FROM discovery_members m
+                    JOIN cameras c ON c.id = m.camera_id
+                    WHERE c.deleted=0 AND m.source_path IN ({ph})
+                    ORDER BY m.source_path, c.id
+                    ''',
+                    chunk,
+                ).fetchall()
+            except sqlite3.Error as exc:
+                log.warning(
+                    'Discovery rehydration query failed for %d sources: %s',
+                    len(chunk), exc,
+                )
                 rows = []
+
             for row in rows:
                 cam = _db_row(row)
                 cid = str(cam.get('id') or '')
-                source = str(cam.get('source_file') or '')
-                if not cid or cid in seen_ids:
-                    if cid and source:
-                        source_members.setdefault(source, set()).add(cid)
+                discovery_source = str(row['discovery_source'] or '')
+                if not cid or not discovery_source:
+                    continue
+
+                # Always restore the complete source membership, even when the
+                # camera was already rehydrated from another source.
+                source_members.setdefault(discovery_source, set()).add(cid)
+
+                if cid in seen_ids:
                     continue
                 seen_ids.add(cid)
-                source_members.setdefault(source, set()).add(cid)
-                # These rows are rehydrated from SQLite only to rebuild the
-                # returned inventory and source-membership map. They came from
-                # unchanged files, so do NOT send them through on_batch again:
-                # doing so rewrites every camera and requeues validation on each
-                # scheduled scan, causing avoidable SQLite lock contention.
+
+                # These rows are rehydrated only to rebuild the returned
+                # inventory. Do NOT send them through on_batch: unchanged
+                # sources must not rewrite every camera/requeue validation.
                 if collect:
                     cameras.append(cam)
+
     flush_batch(force=True)
     _last_discovery_members = source_members
-    log.info('Discovery: parsed=%d cameras in %s%s; unchanged sources are rehydrated from SQLite without rewriting', len(cameras), search_dir,
-             ' (forced)' if force else '')
+    log.info(
+        'Discovery: rehydrated=%d cameras from SQLite across %d current sources%s; '
+        'unchanged sources were not rewritten',
+        len(cameras), len(current_sources), ' (forced)' if force else ''
+    )
     return cameras
 
 
