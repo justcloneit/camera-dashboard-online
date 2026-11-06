@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Dashboard v225.0 — Resource-Aware Validation
+Camera Dashboard v227.0 — Resource-Aware Validation
 ==========================================================
 Database · Discovery · Validation · Streaming · Telegram · Browser UI
 
