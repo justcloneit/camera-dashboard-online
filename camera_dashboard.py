@@ -198,7 +198,7 @@ except ImportError:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION = '221.0'
+VERSION = '223.0'
 SCHEMA_VERSION = 140
 SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
 # Default runtime/data location is the project workspace itself.
@@ -1548,7 +1548,15 @@ def _required_permission_for_request() -> str | None:
         return 'security.view'
     if path.startswith('/api/v64/validation/control'):
         return 'diagnostics.run'
+    # Session status is an authentication heartbeat, not a privileged
+    # management API. It must not fall through to the default security.manage
+    # rule, otherwise readonly/viewer users receive 403 and the browser's
+    # auth monitor redirects them back to /login repeatedly.
+    if path == '/api/session-status':
+        return None
     if path.startswith('/api/v64/dashboard-metrics'):
+        return 'dashboard.view'
+    if path in {'/api/stats', '/api/category/progress', '/api/validate_progress'}:
         return 'dashboard.view'
     if path.startswith('/api/v110/backup') or path.startswith('/api/v110/db') or path.startswith('/api/v110/maintenance') or path.startswith('/api/v110/retention') or path.startswith('/api/v110/api-keys'):
         return 'database.manage'
@@ -7811,8 +7819,13 @@ async function pollCategoryProgress() {
 window.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.group-section[data-group]').forEach(sec=>{try{const x=localStorage.getItem('camera-dashboard-section:'+(sec.dataset.group||sec.id||'unknown'));if(x==='0')sec.classList.remove('expanded');if(x==='1')sec.classList.add('expanded');}catch(_) {}});
   document.querySelectorAll('.group-section[data-loaded="loading"]').forEach(loadGroupCams);
-  pollValidation();
-  pollCategoryProgress();
+  // Read-only/viewer sessions must not poll operational progress endpoints.
+  // Those endpoints are intentionally privileged and otherwise return 403
+  // repeatedly, which makes the dashboard look like it is constantly refreshing.
+  const __dashCanDiagnostics = {{ 'true' if can_diagnostics else 'false' }};
+  const __dashCanCameraManage = {{ 'true' if can_camera_manage else 'false' }};
+  if (__dashCanDiagnostics) pollValidation();
+  if (__dashCanCameraManage) pollCategoryProgress();
   scheduleStatsRefresh();
 });
 
@@ -9853,8 +9866,19 @@ window.saveCurrentDashboardLayout=async function(){
     }catch(e){status(false);const live=$('v63OpsLive');if(live)live.textContent='Metrics unavailable: '+e.message;}
     finally{busy=false;}
   };
-  v63RefreshOps();v64ControlState();timer=setInterval(v63RefreshOps,3000);
-  document.addEventListener('visibilitychange',()=>{if(document.hidden){if(timer)clearInterval(timer);timer=null;}else{v63RefreshOps();if(!timer)timer=setInterval(v63RefreshOps,3000);}});
+  // Read-only/viewer users do not need the 3-second operational polling.
+  // It was causing unnecessary dashboard requests for viewer sessions.
+  const __dashCanDiagnostics = {{ 'true' if can_diagnostics else 'false' }};
+  v63RefreshOps();
+  if (__dashCanDiagnostics) {
+    v64ControlState();
+    timer=setInterval(v63RefreshOps,3000);
+  }
+  document.addEventListener('visibilitychange',()=>{
+    if (!__dashCanDiagnostics) return;
+    if(document.hidden){if(timer)clearInterval(timer);timer=null;}
+    else{v63RefreshOps();if(!timer)timer=setInterval(v63RefreshOps,3000);}
+  });
 })();
 </script>
 
